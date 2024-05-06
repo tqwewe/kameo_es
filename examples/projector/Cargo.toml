@@ -1,0 +1,18 @@
+[package]
+name = "projector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bank_account = { path = "../bank_account" }
+
+anyhow = "1.0.82"
+futures = "0.3.30"
+kameo = { path = "../../../kameo/crates/kameo" }
+kameo_es = { path = "../.." }
+message_db = { path = "../../../../thalo-rs/message_db" }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.116"
+thiserror = "1.0.58"
+tokio = { version = "1.37.0", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
