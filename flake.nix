@@ -27,6 +27,7 @@
             openssl
             pkg-config
             rust-bin
+            protobuf
             darwin.apple_sdk.frameworks.CoreServices
             darwin.apple_sdk.frameworks.SystemConfiguration
           ];

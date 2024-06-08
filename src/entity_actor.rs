@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use kameo::{
-    actor::ActorRef,
+    actor::{ActorRef, BoundedMailbox, WorkerMsg},
     error::{BoxError, SendError},
     message::{Context, Message},
     Actor,
@@ -51,15 +51,16 @@ impl<E> EntityActor<E> {
         loop {
             let messages = self
                 .event_store
-                .send(GetStreamMessages::<E::Event, E::Metadata>::new(
+                .ask(WorkerMsg(GetStreamMessages::<E::Event, E::Metadata>::new(
                     self.stream_name.clone(),
                     GetStreamMessagesOpts::builder()
                         .batch_size(1_000)
                         .position(self.version + 1)
                         .build(),
-                ))
+                )))
+                .send()
                 .await
-                .map_err(SendError::flatten)?;
+                .map_err(|err| err.map_msg(|msg| msg.0).flatten())?;
             let len = messages.len();
 
             for message in messages {
@@ -79,6 +80,8 @@ impl<E> Actor for EntityActor<E>
 where
     E: Entity,
 {
+    type Mailbox = BoundedMailbox<Self>;
+
     fn name() -> &'static str {
         "EntityActor"
     }
@@ -139,8 +142,10 @@ impl<M, E, Me> From<SendError<M, WriteMessagesError<Me>>> for ExecuteError<E> {
         match err {
             SendError::ActorNotRunning(_) => ExecuteError::EventStoreActorNotRunning,
             SendError::ActorStopped => ExecuteError::EventStoreActorStopped,
+            SendError::MailboxFull(_) => unreachable!("sending is always awaited"),
             SendError::HandlerError(err) => err.into(),
-            SendError::QueriesNotSupported => panic!("the event store is never queried"),
+            SendError::Timeout(_) => unreachable!("no timeouts are used in the event store"),
+            SendError::QueriesNotSupported => unreachable!("the event store is never queried"),
         }
     }
 }
@@ -150,8 +155,10 @@ impl<M, E> From<SendError<M, message_db::Error>> for ExecuteError<E> {
         match err {
             SendError::ActorNotRunning(_) => ExecuteError::EventStoreActorNotRunning,
             SendError::ActorStopped => ExecuteError::EventStoreActorStopped,
+            SendError::MailboxFull(_) => unreachable!("sending is always awaited"),
             SendError::HandlerError(err) => err.into(),
-            SendError::QueriesNotSupported => panic!("the event store is never queried"),
+            SendError::Timeout(_) => unreachable!("no timeouts are used in the event store"),
+            SendError::QueriesNotSupported => unreachable!("the event store is never queried"),
         }
     }
 }
@@ -190,14 +197,15 @@ where
                 .map_err(ExecuteError::Handle)?;
             let res = self
                 .event_store
-                .send(WriteMessages {
+                .ask(WorkerMsg(WriteMessages {
                     stream_name: self.stream_name.clone(),
                     messages: events.clone(),
                     expected_version: Some(self.version),
                     metadata,
-                })
+                }))
+                .send()
                 .await
-                .map_err(|err| err.flatten());
+                .map_err(|err| err.map_msg(|msg| msg.0).flatten());
             match res {
                 Ok(_) => {
                     break events;

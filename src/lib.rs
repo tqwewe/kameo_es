@@ -91,7 +91,7 @@ where
         Vec<<E as Entity>::Event>,
         SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
     > {
-        cmd_service.send(command).await
+        cmd_service.ask(command).send().await
     }
 }
 
@@ -166,12 +166,13 @@ where
         let (delegated_reply, reply_sender) = ctx.reply_sender();
         tokio::spawn(async move {
             let reply = entity_ref
-                .send(entity_actor::Execute {
+                .ask(entity_actor::Execute {
                     id: msg.id.clone(),
                     command: msg.command,
                     expected_version: msg.expected_version,
                     metadata: msg.metadata,
                 })
+                .send()
                 .await;
             if let Some(reply_sender) = reply_sender {
                 let reply = reply.map_err(|err| match err {
@@ -183,7 +184,11 @@ where
                         category: E::category(),
                         id: msg.id,
                     },
+                    SendError::MailboxFull(_) => {
+                        unreachable!("sending is awaited, so this error should never occur")
+                    }
                     SendError::HandlerError(err) => err,
+                    SendError::Timeout(_) => unreachable!("no timeout is set"),
                     SendError::QueriesNotSupported => panic!("the entity actor is never queried"),
                 });
                 reply_sender.send(reply);
