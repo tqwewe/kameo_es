@@ -1,97 +1,114 @@
-use std::{fmt, marker::PhantomData};
+use std::{fmt, future::Future, marker::PhantomData};
 
+use commitlog::{
+    server::eventstore::{
+        event_store_client::EventStoreClient, AppendToStreamRequest, GetStreamEventsRequest,
+        NewEvent,
+    },
+    CurrentVersion, Event, ExpectedVersion,
+};
+use futures::{stream::BoxStream, TryStreamExt};
 use kameo::{
     actor::{ActorPool, ActorRef},
     message::{Context, Message},
     Actor,
 };
-use message_db::{
-    database::{GetStreamMessagesOpts, MessageStore, WriteMessageOpts},
-    stream_name::StreamName,
-};
 use serde::{de::DeserializeOwned, Serialize};
+use tonic::{transport::Channel, Status};
 
-use crate::{Error, EventType};
+use crate::{stream_id::StreamID, Error, EventType};
 
 pub type EventStore = ActorRef<ActorPool<EventStoreWorker>>;
 
-pub fn new_event_store(store: MessageStore, size: usize) -> EventStore {
+pub fn new_event_store(client: EventStoreClient<Channel>, size: usize) -> EventStore {
     kameo::spawn(ActorPool::new(size, move || {
         kameo::spawn(EventStoreWorker {
-            store: store.clone(),
+            client: client.clone(),
         })
     }))
 }
 
 #[derive(Actor)]
 pub struct EventStoreWorker {
-    store: MessageStore,
+    client: EventStoreClient<Channel>,
 }
 
-pub struct GetStreamMessages<E, M> {
-    stream_name: StreamName,
-    opts: GetStreamMessagesOpts<'static>,
+pub struct GetStreamEvents<E, M> {
+    stream_id: StreamID,
+    stream_version: u64,
     phantom: PhantomData<(E, M)>,
 }
 
-impl<E, M> GetStreamMessages<E, M> {
-    pub fn new(
-        stream_name: StreamName,
-        opts: GetStreamMessagesOpts<'static>,
-    ) -> GetStreamMessages<E, M> {
-        GetStreamMessages {
-            stream_name,
-            opts,
+impl<E, M> GetStreamEvents<E, M> {
+    pub fn new(stream_id: StreamID, stream_version: u64) -> GetStreamEvents<E, M> {
+        GetStreamEvents {
+            stream_id,
+            stream_version,
             phantom: PhantomData,
         }
     }
 }
 
-impl<E, M> Message<GetStreamMessages<E, M>> for EventStoreWorker
+impl<E, M> Message<GetStreamEvents<E, M>> for EventStoreWorker
 where
     E: DeserializeOwned + Send + 'static,
     M: DeserializeOwned + Default + Unpin + Send + 'static,
 {
-    type Reply = Result<Vec<message_db::message::Message<E, M>>, message_db::Error>;
+    type Reply = Result<BoxStream<'static, Result<Vec<Event<'static>>, Status>>, Status>;
 
-    async fn handle(
+    fn handle(
         &mut self,
-        msg: GetStreamMessages<E, M>,
+        msg: GetStreamEvents<E, M>,
         _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        let messages =
-            MessageStore::get_stream_messages::<E, M, _>(&self.store, &msg.stream_name, &msg.opts)
-                .await?;
+    ) -> impl Future<Output = Self::Reply> + Send {
+        async move {
+            let stream = self
+                .client
+                .get_stream_events(GetStreamEventsRequest {
+                    stream_id: msg.stream_id.into_inner(),
+                    stream_version: msg.stream_version,
+                    batch_size: 1000,
+                })
+                .await?
+                .into_inner()
+                .map_ok(|batch| {
+                    batch
+                        .events
+                        .into_iter()
+                        .map(|event| Event::<'static>::try_from(event).expect("invalid timestamp"))
+                        .collect()
+                });
 
-        Ok(messages)
+            Ok(Box::pin(stream) as BoxStream<'static, _>)
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct WriteMessages<E, M> {
-    pub stream_name: StreamName,
-    pub messages: Vec<E>,
-    pub expected_version: Option<i64>,
+pub struct AppendEvents<E, M> {
+    pub stream_name: StreamID,
+    pub events: Vec<E>,
+    pub expected_version: ExpectedVersion,
     pub metadata: M,
 }
 
 #[derive(Error)]
-pub enum WriteMessagesError<M> {
+pub enum AppendEventsError<M> {
     #[error(transparent)]
-    Database(message_db::Error),
+    Database(#[from] Status),
     #[error("expected '{category}-{id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
         category: String,
         id: String,
-        current: i64,
-        expected: i64,
+        current: CurrentVersion,
+        expected: ExpectedVersion,
         metadata: M,
     },
     #[error(transparent)]
     SerializeEvent(#[from] serde_json::Error),
 }
 
-impl<M> fmt::Debug for WriteMessagesError<M> {
+impl<M> fmt::Debug for AppendEventsError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(arg0) => f.debug_tuple("Database").field(arg0).finish(),
@@ -113,74 +130,39 @@ impl<M> fmt::Debug for WriteMessagesError<M> {
     }
 }
 
-impl<M> From<(M, message_db::Error)> for WriteMessagesError<M> {
-    fn from((metadata, err): (M, message_db::Error)) -> Self {
-        if let message_db::Error::Database(err) = &err {
-            if let Some(err) = err.as_database_error() {
-                let msg = err.message().trim();
-                let prefix = "Wrong expected version: ";
-                if msg.starts_with(prefix) {
-                    let msg = msg.split_at(prefix.len()).1;
-                    let (expected, msg) = msg.split_once(' ').unwrap();
-                    let expected = expected.parse().unwrap();
-                    let prefix = " (Stream: ";
-                    let (_, msg) = msg.split_at(prefix.len() - 1);
-                    let (stream_name, msg) = msg.split_once(", Stream Version: ").unwrap();
-                    let (category, id) = stream_name.split_once('-').unwrap();
-                    let (current, _) = msg.split_once(')').unwrap();
-                    let current = current.parse().unwrap();
-
-                    return WriteMessagesError::IncorrectExpectedVersion {
-                        category: category.to_string(),
-                        id: id.to_string(),
-                        current,
-                        expected,
-                        metadata,
-                    };
-                }
-            }
-        }
-
-        WriteMessagesError::Database(err)
-    }
-}
-
-impl<E, M> Message<WriteMessages<E, M>> for EventStoreWorker
+impl<E, M> Message<AppendEvents<E, M>> for EventStoreWorker
 where
     E: EventType + Serialize + Send + 'static,
     M: Serialize + Send + Sync + 'static,
 {
-    type Reply = Result<i64, WriteMessagesError<M>>;
+    type Reply = Result<(), AppendEventsError<M>>;
 
     async fn handle(
         &mut self,
-        msg: WriteMessages<E, M>,
+        msg: AppendEvents<E, M>,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let messages: Vec<_> = msg
-            .messages
+        let metadata =
+            serde_json::to_vec(&msg.metadata).map_err(AppendEventsError::SerializeEvent)?;
+        let events = msg
+            .events
             .iter()
-            .enumerate()
-            .map(|(i, event)| {
-                let opts = match (msg.expected_version, &msg.metadata) {
-                    (Some(v), metadata) => WriteMessageOpts::builder()
-                        .expected_version(v + i as i64)
-                        .metadata(metadata)
-                        .build(),
-                    (None, metadata) => WriteMessageOpts::builder().metadata(metadata).build(),
-                };
-                Ok((event.event_type(), serde_json::to_value(event)?, opts))
+            .map(|event| {
+                Ok(NewEvent {
+                    event_name: event.event_type().to_string(),
+                    event_data: serde_json::to_vec(&event)?,
+                    metadata: metadata.clone(),
+                })
             })
             .collect::<Result<_, serde_json::Error>>()?;
-        let messages_ref: Vec<_> = messages
-            .iter()
-            .map(|(event_type, data, opts)| (*event_type, data, opts))
-            .collect();
-        let latest_version =
-            MessageStore::write_messages(&self.store, &msg.stream_name, &messages_ref)
-                .await
-                .map_err(|err| (msg.metadata, err))?;
+        let req = AppendToStreamRequest {
+            stream_id: msg.stream_name.into_inner(),
+            expected_version: Some(msg.expected_version.into()),
+            events,
+        };
 
-        Ok(latest_version)
+        self.client.append_to_stream(req).await?;
+
+        Ok(())
     }
 }

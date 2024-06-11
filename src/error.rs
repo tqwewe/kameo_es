@@ -1,13 +1,15 @@
 use std::{borrow::Cow, sync::Arc};
 
+use commitlog::{CurrentVersion, ExpectedVersion};
 use thiserror::Error;
+use tonic::Status;
 
 #[derive(Debug, Error)]
 pub enum ExecuteError<E> {
     #[error(transparent)]
     Handle(E),
     #[error(transparent)]
-    Database(#[from] message_db::Error),
+    Database(#[from] Status),
     #[error("entity '{category}-{id}' actor not running")]
     EntityActorNotRunning {
         category: &'static str,
@@ -28,8 +30,8 @@ pub enum ExecuteError<E> {
     IncorrectExpectedVersion {
         category: Cow<'static, str>,
         id: Arc<str>,
-        current: i64,
-        expected: i64,
+        current: CurrentVersion,
+        expected: ExpectedVersion,
     },
     #[error("too many write conflicts for stream '{category}-{id}'")]
     TooManyConflicts {
