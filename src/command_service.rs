@@ -1,6 +1,6 @@
 use std::{any, collections::HashMap, fmt, marker::PhantomData, sync::Arc};
 
-use commitlog::ExpectedVersion;
+use eventus::ExpectedVersion;
 use futures::Future;
 use kameo::{
     actor::{ActorRef, BoundedMailbox},
@@ -16,7 +16,7 @@ use crate::{
     error::ExecuteError,
     event_store::EventStore,
     stream_id::StreamID,
-    Command, Entity,
+    Apply, Command, Entity,
 };
 
 /// The command service routes commands to spawned entity actors per stream id.
@@ -58,7 +58,7 @@ where
         command: Execute<E, C, E::Metadata>,
     ) -> impl Future<
         Output = Result<
-            Vec<<E as Entity>::Event>,
+            Vec<E::Event>,
             SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
         >,
     >;
@@ -66,7 +66,7 @@ where
 
 impl<E, C> ExecuteExt<E, C> for E
 where
-    E: Entity + Command<C> + Default + Sync,
+    E: Entity + Command<C> + Apply + Default + Sync,
     E::Event: Clone,
     E::Error: fmt::Debug + Send + Sync,
     C: Clone + Send + 'static,
@@ -74,10 +74,7 @@ where
     async fn execute(
         cmd_service: &ActorRef<CommandService>,
         command: Execute<E, C, E::Metadata>,
-    ) -> Result<
-        Vec<<E as Entity>::Event>,
-        SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
-    > {
+    ) -> Result<Vec<E::Event>, SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>> {
         cmd_service.ask(command).send().await
     }
 }
@@ -118,26 +115,24 @@ impl<E, C, M> Execute<E, C, M> {
 
 impl<E, C> Message<Execute<E, C, E::Metadata>> for CommandService
 where
-    E: Command<C> + Default + Sync,
-    E::Event: Clone,
-    E::Error: fmt::Debug + Send + Sync,
+    E: Command<C> + Apply,
     C: Clone + Send + 'static,
 {
-    type Reply = DelegatedReply<Result<Vec<<E as Entity>::Event>, ExecuteError<E::Error>>>;
+    type Reply = DelegatedReply<Result<Vec<E::Event>, ExecuteError<E::Error>>>;
 
     async fn handle(
         &mut self,
         msg: Execute<E, C, E::Metadata>,
         mut ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let stream_name = StreamID::new_from_parts(E::category(), &msg.id);
+        let stream_name = StreamID::new_from_parts(E::name(), &msg.id);
         let entity_ref = match self.entities.get(&stream_name) {
             Some((_, actor_ref)) => actor_ref
                 .downcast_ref::<ActorRef<EntityActor<E>>>()
                 .cloned()
                 .unwrap(),
             None => {
-                let entity_ref = kameo::spawn(EntityActor::new(
+                let entity_ref = kameo::actor::spawn_unsync(EntityActor::new(
                     E::default(),
                     stream_name.clone(),
                     self.event_store.clone(),
@@ -158,7 +153,7 @@ where
             Some(tx) => {
                 let _ = entity_ref
                     .ask(entity_actor::Execute {
-                        id: msg.id.clone(),
+                        id: msg.id,
                         command: msg.command,
                         expected_version: msg.expected_version,
                         metadata: msg.metadata,
@@ -169,7 +164,7 @@ where
             None => {
                 let _ = entity_ref
                     .tell(entity_actor::Execute {
-                        id: msg.id.clone(),
+                        id: msg.id,
                         command: msg.command,
                         expected_version: msg.expected_version,
                         metadata: msg.metadata,
@@ -190,7 +185,7 @@ pub struct PrepareStream<E> {
 
 impl<E> Message<PrepareStream<E>> for CommandService
 where
-    E: Entity + Default + Send + Sync,
+    E: Entity + Apply + Default + Send + Sync,
 {
     type Reply = ();
 
@@ -199,7 +194,7 @@ where
         msg: PrepareStream<E>,
         ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let stream_name = StreamID::new_from_parts(E::category(), &msg.id);
+        let stream_name = StreamID::new_from_parts(E::name(), &msg.id);
         match self.entities.get(&stream_name) {
             Some(_) => {}
             None => {

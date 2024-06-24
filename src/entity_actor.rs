@@ -1,6 +1,6 @@
-use std::{fmt, sync::Arc, time::Instant};
+use std::sync::Arc;
 
-use commitlog::{CurrentVersion, Event, ExpectedVersion};
+use eventus::{CurrentVersion, Event, ExpectedVersion};
 use futures::StreamExt;
 use kameo::{
     actor::{ActorRef, BoundedMailbox, WorkerMsg},
@@ -16,12 +16,12 @@ use crate::{
     error::ExecuteError,
     event_store::{AppendEvents, AppendEventsError, EventStore, GetStreamEvents},
     stream_id::StreamID,
-    Command, Entity,
+    Apply, Command, Entity,
 };
 
 pub struct EntityActor<E> {
     entity: E,
-    stream_name: StreamID,
+    stream_id: StreamID,
     event_store: EventStore,
     version: CurrentVersion,
     conflict_reties: usize,
@@ -37,7 +37,7 @@ impl<E> EntityActor<E> {
     ) -> Self {
         EntityActor {
             entity,
-            stream_name,
+            stream_id: stream_name,
             event_store,
             version: CurrentVersion::NoStream,
             conflict_reties: 3,
@@ -47,7 +47,7 @@ impl<E> EntityActor<E> {
 
     async fn resync_with_db(&mut self) -> Result<(), BoxError>
     where
-        E: Entity,
+        E: Entity + Apply,
     {
         let from_version = match self.version {
             CurrentVersion::Current(version) => version + 1,
@@ -60,16 +60,14 @@ impl<E> EntityActor<E> {
                 <E as Entity>::Event,
                 <E as Entity>::Metadata,
             >::new(
-                self.stream_name.clone(), from_version
+                self.stream_id.clone(), from_version
             )))
             .send()
             .await
             .map_err(|err| err.map_msg(|msg| msg.0))?;
 
-        let mut start = Instant::now();
         while let Some(res) = stream.next().await {
             let batch = res?;
-            let len = batch.len();
             for event in batch {
                 assert_eq!(
                     match self.version {
@@ -77,16 +75,17 @@ impl<E> EntityActor<E> {
                         CurrentVersion::NoStream => 0,
                     },
                     event.stream_version,
-                    "the event being applied should be the next stream version"
+                    "expected stream version {} but got {} for stream {}",
+                    match self.version {
+                        CurrentVersion::Current(version) => version + 1,
+                        CurrentVersion::NoStream => 0,
+                    },
+                    event.stream_version,
+                    event.stream_id,
                 );
+                self.entity.apply(rmp_serde::from_slice(&event.event_data)?);
                 self.version = CurrentVersion::Current(event.stream_version);
-                self.entity.apply_event(event);
             }
-            println!(
-                "handled batch of {len} events in {} ms",
-                start.elapsed().as_millis()
-            );
-            start = Instant::now();
         }
 
         Ok(())
@@ -95,7 +94,7 @@ impl<E> EntityActor<E> {
 
 impl<E> Actor for EntityActor<E>
 where
-    E: Entity,
+    E: Entity + Apply,
 {
     type Mailbox = BoundedMailbox<Self>;
 
@@ -112,16 +111,17 @@ where
 
 impl<E> Message<Event<'static>> for EntityActor<E>
 where
-    E: Entity,
+    E: Entity + Apply,
 {
-    type Reply = ();
+    type Reply = Result<(), rmp_serde::decode::Error>;
 
     async fn handle(
         &mut self,
         event: Event<'static>,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        self.entity.apply_event(event)
+        self.entity.apply(rmp_serde::from_slice(&event.event_data)?);
+        Ok(())
     }
 }
 
@@ -134,9 +134,7 @@ pub struct Execute<C, M> {
 
 impl<E, C> Message<Execute<C, E::Metadata>> for EntityActor<E>
 where
-    E: Command<C>,
-    E::Event: Clone,
-    E::Error: fmt::Debug + Send + Sync + 'static,
+    E: Command<C> + Apply,
     C: Clone + Send,
 {
     type Reply = Result<Vec<E::Event>, ExecuteError<E::Error>>;
@@ -151,7 +149,7 @@ where
         let events = loop {
             if msg.expected_version.validate(self.version).is_err() {
                 return Err(ExecuteError::IncorrectExpectedVersion {
-                    category: E::category().into(),
+                    category: E::name().into(),
                     id: msg.id,
                     current: self.version,
                     expected: msg.expected_version,
@@ -165,7 +163,7 @@ where
             let res = self
                 .event_store
                 .ask(WorkerMsg(AppendEvents {
-                    stream_name: self.stream_name.clone(),
+                    stream_name: self.stream_id.clone(),
                     events: events.clone(),
                     expected_version: self.version.as_expected_version(),
                     metadata,
@@ -187,7 +185,7 @@ where
                     debug!(%category, %id, %current, %expected, "write conflict");
                     if attempt == self.conflict_reties {
                         return Err(ExecuteError::TooManyConflicts {
-                            category: E::category(),
+                            category: E::name(),
                             id: msg.id,
                         });
                     }

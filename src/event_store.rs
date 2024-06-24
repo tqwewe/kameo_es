@@ -1,6 +1,7 @@
 use std::{fmt, future::Future, marker::PhantomData};
 
-use commitlog::{
+use chrono::{DateTime, Utc};
+use eventus::{
     server::eventstore::{
         event_store_client::EventStoreClient, AppendToStreamRequest, GetStreamEventsRequest,
         NewEvent,
@@ -105,7 +106,7 @@ pub enum AppendEventsError<M> {
         metadata: M,
     },
     #[error(transparent)]
-    SerializeEvent(#[from] serde_json::Error),
+    SerializeEvent(#[from] rmp_serde::encode::Error),
 }
 
 impl<M> fmt::Debug for AppendEventsError<M> {
@@ -135,7 +136,7 @@ where
     E: EventType + Serialize + Send + 'static,
     M: Serialize + Send + Sync + 'static,
 {
-    type Reply = Result<(), AppendEventsError<M>>;
+    type Reply = Result<(u64, DateTime<Utc>), AppendEventsError<M>>;
 
     async fn handle(
         &mut self,
@@ -143,26 +144,33 @@ where
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let metadata =
-            serde_json::to_vec(&msg.metadata).map_err(AppendEventsError::SerializeEvent)?;
+            rmp_serde::to_vec_named(&msg.metadata).map_err(AppendEventsError::SerializeEvent)?;
         let events = msg
             .events
             .iter()
             .map(|event| {
                 Ok(NewEvent {
                     event_name: event.event_type().to_string(),
-                    event_data: serde_json::to_vec(&event)?,
+                    event_data: rmp_serde::to_vec_named(&event)?,
                     metadata: metadata.clone(),
                 })
             })
-            .collect::<Result<_, serde_json::Error>>()?;
+            .collect::<Result<_, rmp_serde::encode::Error>>()?;
         let req = AppendToStreamRequest {
             stream_id: msg.stream_name.into_inner(),
             expected_version: Some(msg.expected_version.into()),
             events,
         };
 
-        self.client.append_to_stream(req).await?;
+        let res = self.client.append_to_stream(req).await?.into_inner();
+        let id = res.first_id;
+        let timestamp = res.timestamp.unwrap();
 
-        Ok(())
+        Ok((
+            id,
+            DateTime::from_timestamp(timestamp.seconds, timestamp.nanos.try_into().unwrap())
+                .unwrap()
+                .to_utc(),
+        ))
     }
 }

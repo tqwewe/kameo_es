@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.82"
-commitlog = { path = "../../../commitlog" }
-kameo = { path = "../../../kameo/crates/kameo" }
+eventus = { path = "../../../eventus" }
+console-subscriber = "0.3.0"
+kameo = { path = "../../../kameo/kameo" }
 kameo_es = { path = "../.." }
 # message_db = { path = "../../../../thalo-rs/message_db" }
 serde = { version = "1.0.197", features = ["derive"] }

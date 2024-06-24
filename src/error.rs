@@ -1,12 +1,12 @@
 use std::{borrow::Cow, sync::Arc};
 
-use commitlog::{CurrentVersion, ExpectedVersion};
+use eventus::{CurrentVersion, ExpectedVersion};
 use thiserror::Error;
 use tonic::Status;
 
 #[derive(Debug, Error)]
 pub enum ExecuteError<E> {
-    #[error(transparent)]
+    #[error("{0:?}")]
     Handle(E),
     #[error(transparent)]
     Database(#[from] Status),
@@ -25,7 +25,7 @@ pub enum ExecuteError<E> {
     #[error("event store actor stopped")]
     EventStoreActorStopped,
     #[error(transparent)]
-    SerializeEvent(#[from] serde_json::Error),
+    SerializeEvent(#[from] rmp_serde::encode::Error),
     #[error("expected '{category}-{id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
         category: Cow<'static, str>,

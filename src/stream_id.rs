@@ -139,8 +139,8 @@ impl StreamID {
     ///
     /// This is the first ID. If there is only one ID present, that is the
     /// cardinal ID.
-    pub fn cardinal_id(&self) -> Option<&str> {
-        self.ids().next()
+    pub fn cardinal_id(&self) -> &str {
+        self.ids().next().unwrap()
     }
 
     /// Returns whether a `stream_id` is a category.

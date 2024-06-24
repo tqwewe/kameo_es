@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use commitlog::server::eventstore::event_store_client::EventStoreClient;
+use eventus::server::eventstore::event_store_client::EventStoreClient;
 use kameo_es::{
     command_service::{CommandService, Execute, ExecuteExt, PrepareStream},
     event_store::new_event_store,
@@ -16,17 +16,18 @@ use bank_account::{BankAccount, Deposit};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("kameo=warn".parse::<EnvFilter>().unwrap())
-        .without_time()
-        .with_target(false)
-        .init();
+    console_subscriber::init();
+    // tracing_subscriber::fmt()
+    //     .with_env_filter("kameo=warn".parse::<EnvFilter>().unwrap())
+    //     .without_time()
+    //     .with_target(false)
+    //     .init();
 
     // let message_store = MessageStore::connect(
     //     "postgresql://postgres:postgres@localhost:5433/message_store?options=-c%20search_path%3Dmessage_store",
     // )
     // .await?;
-    let client = EventStoreClient::connect("http://[::1]:50051").await?;
+    let client = EventStoreClient::connect("http://[::1]:9220").await?;
     let event_store = new_event_store(client, 8);
     // 8 = 31501 ms
     // 16 = 31238 ms
@@ -75,21 +76,21 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("{} ms", start.elapsed().as_millis());
 
-    // loop {
-    //     let start = Instant::now();
-    //     for _ in 0..10_000 {
-    //         let res = BankAccount::execute(
-    //             &cmd_service,
-    //             Execute::new("def", Deposit { amount: 10_000 }).metadata(json!({ "hi": "there" })),
-    //         )
-    //         .await;
-    //         if let Err(err) = res {
-    //             println!("{err}");
-    //         }
-    //     }
-    //     println!("{} ms", start.elapsed().as_millis());
-    //     // tokio::time::sleep(Duration::from_millis(5000)).await;
-    // }
+    loop {
+        let start = Instant::now();
+        for _ in 0..10 {
+            let res = BankAccount::execute(
+                &cmd_service,
+                Execute::new("def", Deposit { amount: 10_000 }).metadata(json!({ "hi": "there" })),
+            )
+            .await;
+            if let Err(err) = res {
+                println!("{err}");
+            }
+        }
+        println!("{} ms", start.elapsed().as_millis());
+        tokio::time::sleep(Duration::from_millis(5000)).await;
+    }
 
     Ok(())
 }

@@ -1,5 +1,5 @@
 use anyhow::bail;
-use kameo_es::{Command, Entity, EventType};
+use kameo_es::{Apply, Command, Entity, EventType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,15 +12,8 @@ impl Entity for BankAccount {
     type Event = BankAccountEvent;
     type Metadata = Value;
 
-    fn category() -> &'static str {
+    fn name() -> &'static str {
         "BankAccount"
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        match event {
-            BankAccountEvent::MoneyWithdrawn { amount } => self.balance -= amount as i64,
-            BankAccountEvent::MoneyDeposited { amount } => self.balance += amount as i64,
-        }
     }
 }
 
@@ -28,6 +21,15 @@ impl Entity for BankAccount {
 pub enum BankAccountEvent {
     MoneyWithdrawn { amount: u32 },
     MoneyDeposited { amount: u32 },
+}
+
+impl Apply<BankAccountEvent> for BankAccount {
+    fn apply(&mut self, event: Self::Event) {
+        match event {
+            BankAccountEvent::MoneyWithdrawn { amount } => self.balance -= amount as i64,
+            BankAccountEvent::MoneyDeposited { amount } => self.balance += amount as i64,
+        }
+    }
 }
 
 impl EventType for BankAccountEvent {
