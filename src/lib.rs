@@ -8,10 +8,18 @@ pub mod test_utils;
 use core::fmt;
 use std::convert::Infallible;
 
+use eventus::{
+    server::eventstore::{
+        event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
+        SubscribeRequest,
+    },
+    Event,
+};
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use kameo::error::SendError;
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
-use tonic::Status;
+use tonic::{transport::Channel, Code, Status};
 
 pub trait Entity: Default + Send + 'static {
     type Event: EventType + Clone + Serialize + DeserializeOwned + Send + Sync;
@@ -43,6 +51,30 @@ pub enum Error<M = (), E = Infallible> {
     Database(#[from] Status),
     #[error(transparent)]
     SendError(#[from] SendError<M, E>),
+}
+
+pub async fn subscribe(
+    mut client: EventStoreClient<Channel>,
+    start_from: StartFrom,
+) -> Result<BoxStream<'static, Result<Vec<Event<'static>>, Status>>, Status> {
+    let stream = client
+        .subscribe(SubscribeRequest {
+            start_from: Some(start_from),
+        })
+        .await?
+        .into_inner();
+
+    Ok(stream
+        .and_then(|EventBatch { events }| async move {
+            events
+                .into_iter()
+                .map(|event| {
+                    Event::try_from(event)
+                        .map_err(|_| Status::new(Code::Internal, "invalid timestamp received"))
+                })
+                .collect()
+        })
+        .boxed())
 }
 
 // #[derive(Clone, Debug, PartialEq, Eq)]

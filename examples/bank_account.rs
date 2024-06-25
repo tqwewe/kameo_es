@@ -1,7 +1,25 @@
 use anyhow::bail;
-use kameo_es::{Apply, Command, Entity, EventType};
+use eventus::server::eventstore::event_store_client::EventStoreClient;
+use kameo_es::{
+    command_service::{CommandService, Execute, ExecuteExt},
+    Apply, Command, Entity, EventType,
+};
+
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = EventStoreClient::connect("http://[::1]:9220").await?;
+    let cmd_service = kameo::spawn(CommandService::new(client));
+
+    BankAccount::execute(
+        &cmd_service,
+        Execute::new("abc", Deposit { amount: 10_000 }),
+    )
+    .await?;
+
+    Ok(())
+}
 
 #[derive(Debug, Default)]
 pub struct BankAccount {
@@ -10,7 +28,7 @@ pub struct BankAccount {
 
 impl Entity for BankAccount {
     type Event = BankAccountEvent;
-    type Metadata = Value;
+    type Metadata = ();
 
     fn name() -> &'static str {
         "BankAccount"
@@ -23,7 +41,7 @@ pub enum BankAccountEvent {
     MoneyDeposited { amount: u32 },
 }
 
-impl Apply<BankAccountEvent> for BankAccount {
+impl Apply for BankAccount {
     fn apply(&mut self, event: Self::Event) {
         match event {
             BankAccountEvent::MoneyWithdrawn { amount } => self.balance -= amount as i64,

@@ -1,6 +1,6 @@
 use std::{any, collections::HashMap, fmt, marker::PhantomData, sync::Arc};
 
-use eventus::ExpectedVersion;
+use eventus::{server::eventstore::event_store_client::EventStoreClient, ExpectedVersion};
 use futures::Future;
 use kameo::{
     actor::{ActorRef, BoundedMailbox},
@@ -10,11 +10,12 @@ use kameo::{
     Actor,
 };
 use tokio::sync::Notify;
+use tonic::transport::Channel;
 
 use crate::{
     entity_actor::{self, EntityActor},
     error::ExecuteError,
-    event_store::EventStore,
+    event_store::{new_event_store, EventStore},
     stream_id::StreamID,
     Apply, Command, Entity,
 };
@@ -26,11 +27,25 @@ pub struct CommandService {
 }
 
 impl CommandService {
-    pub fn new(event_store: EventStore) -> Self {
+    /// Creates a new command service using an event store client connection and default worker count.
+    #[inline]
+    pub fn new(client: EventStoreClient<Channel>) -> Self {
+        Self::new_with_workers(client, 16)
+    }
+
+    /// Creates a new command service using an event store client connection and worker count.
+    #[inline]
+    pub fn new_with_workers(client: EventStoreClient<Channel>, workers: usize) -> Self {
         CommandService {
-            event_store,
+            event_store: new_event_store(client, workers),
             entities: HashMap::new(),
         }
+    }
+
+    /// Returns a reference to the inner event store.
+    #[inline]
+    pub fn event_store(&self) -> &EventStore {
+        &self.event_store
     }
 }
 
