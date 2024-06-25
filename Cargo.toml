@@ -1,5 +1,3 @@
-workspace = { members = [ "examples/axon_server_demo","examples/bank_account", "examples/projector"] }
-
 [package]
 name = "kameo_es"
 version = "0.1.0"
@@ -8,16 +6,12 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.82"
 chrono = { version = "0.4", features = ["serde"] }
-eventus = { path = "../eventus" }
+eventus = { git = "https://github.com/tqwewe/eventus" }
 futures = "0.3.30"
-# dendrite = "0.14.1"
-kameo = { path = "../kameo/kameo" }
-# message_db = { path = "../../thalo-rs/message_db" }
+kameo = "0.9.0"
 rmp-serde = "1.3.0"
 serde = { version = "1.0.197", features = ["derive"] }
-# serde_json = "1.0.116"
 thiserror = "1.0.58"
 tokio = { version = "1.37.0", features = ["full"] }
-tokio-postgres = "0.7.10"
 tonic = "0.11"
 tracing = "0.1"
