@@ -1,6 +1,7 @@
 pub mod command_service;
 mod entity_actor;
 pub mod error;
+pub mod event_handler;
 mod event_store;
 pub mod stream_id;
 pub mod test_utils;

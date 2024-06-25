@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
 
     BankAccount::execute(
         &cmd_service,
-        Execute::new("abc", Deposit { amount: 10_000 }),
+        Execute::new("abc".to_string(), Deposit { amount: 10_000 }),
     )
     .await?;
 
@@ -27,6 +27,7 @@ pub struct BankAccount {
 }
 
 impl Entity for BankAccount {
+    type ID = String;
     type Event = BankAccountEvent;
     type Metadata = ();
 
