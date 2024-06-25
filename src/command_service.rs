@@ -95,21 +95,27 @@ where
 }
 
 #[derive(Debug)]
-pub struct Execute<E, C, M> {
-    pub id: Arc<str>,
+pub struct Execute<E, C, M>
+where
+    E: Entity,
+{
+    pub id: E::ID,
     pub command: C,
     pub metadata: M,
     pub expected_version: ExpectedVersion,
     pub phantom: PhantomData<E>,
 }
 
-impl<E, C, M> Execute<E, C, M> {
-    pub fn new(id: impl Into<Arc<str>>, command: C) -> Self
+impl<E, C, M> Execute<E, C, M>
+where
+    E: Entity,
+{
+    pub fn new(id: E::ID, command: C) -> Self
     where
         M: Default,
     {
         Execute {
-            id: id.into(),
+            id,
             command,
             metadata: M::default(),
             expected_version: ExpectedVersion::Any,

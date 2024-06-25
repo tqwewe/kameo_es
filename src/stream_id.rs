@@ -117,7 +117,7 @@ impl StreamID {
     }
 
     /// Creates a new StreamID from a category and id.
-    pub fn new_from_parts(category: &str, id: &str) -> Self {
+    pub fn new_from_parts(category: &str, id: impl fmt::Display) -> Self {
         StreamID::new(format!("{category}{}{id}", Self::ID_SEPARATOR))
     }
 
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn test_cardinal_id() {
         let stream_name = StreamID::new("category:command-123+456");
-        assert_eq!(stream_name.cardinal_id(), Some("123"));
+        assert_eq!(stream_name.cardinal_id(), "123");
     }
 
     #[test]

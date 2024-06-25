@@ -29,13 +29,10 @@ pub enum ExecuteError<E> {
     #[error("expected '{category}-{id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
         category: Cow<'static, str>,
-        id: Arc<str>,
+        id: String,
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
     #[error("too many write conflicts for stream '{category}-{id}'")]
-    TooManyConflicts {
-        category: &'static str,
-        id: Arc<str>,
-    },
+    TooManyConflicts { category: &'static str, id: String },
 }

@@ -125,23 +125,23 @@ where
     }
 }
 
-pub struct Execute<C, M> {
-    pub id: Arc<str>,
+pub struct Execute<I, C, M> {
+    pub id: I,
     pub command: C,
     pub metadata: M,
     pub expected_version: ExpectedVersion,
 }
 
-impl<E, C> Message<Execute<C, E::Metadata>> for EntityActor<E>
+impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityActor<E>
 where
-    E: Command<C> + Apply,
+    E: Entity + Command<C> + Apply,
     C: Clone + Send,
 {
     type Reply = Result<Vec<E::Event>, ExecuteError<E::Error>>;
 
     async fn handle(
         &mut self,
-        msg: Execute<C, E::Metadata>,
+        msg: Execute<E::ID, C, E::Metadata>,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let mut metadata = msg.metadata;
@@ -150,7 +150,7 @@ where
             if msg.expected_version.validate(self.version).is_err() {
                 return Err(ExecuteError::IncorrectExpectedVersion {
                     category: E::name().into(),
-                    id: msg.id,
+                    id: msg.id.to_string(),
                     current: self.version,
                     expected: msg.expected_version,
                 });
@@ -186,7 +186,7 @@ where
                     if attempt == self.conflict_reties {
                         return Err(ExecuteError::TooManyConflicts {
                             category: E::name(),
-                            id: msg.id,
+                            id: msg.id.to_string(),
                         });
                     }
 
