@@ -2,9 +2,12 @@ use std::{fmt, future::Future, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
 use eventus::{
-    server::eventstore::{
-        event_store_client::EventStoreClient, AppendToStreamRequest, GetStreamEventsRequest,
-        NewEvent,
+    server::{
+        eventstore::{
+            event_store_client::EventStoreClient, AppendToStreamRequest, GetStreamEventsRequest,
+            NewEvent,
+        },
+        ClientAuthInterceptor,
     },
     CurrentVersion, Event, ExpectedVersion,
 };
@@ -15,13 +18,16 @@ use kameo::{
     Actor,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use tonic::{transport::Channel, Status};
+use tonic::{service::interceptor::InterceptedService, transport::Channel, Status};
 
 use crate::{stream_id::StreamID, Error, EventType};
 
 pub type EventStore = ActorRef<ActorPool<EventStoreWorker>>;
 
-pub fn new_event_store(client: EventStoreClient<Channel>, size: usize) -> EventStore {
+pub fn new_event_store(
+    client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+    size: usize,
+) -> EventStore {
     kameo::spawn(ActorPool::new(size, move || {
         kameo::spawn(EventStoreWorker {
             client: client.clone(),
@@ -31,7 +37,7 @@ pub fn new_event_store(client: EventStoreClient<Channel>, size: usize) -> EventS
 
 #[derive(Actor)]
 pub struct EventStoreWorker {
-    client: EventStoreClient<Channel>,
+    client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
 }
 
 pub struct GetStreamEvents<E, M> {

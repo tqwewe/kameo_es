@@ -1,8 +1,11 @@
 use std::{cell::OnceCell, time::Duration};
 
-use eventus::server::eventstore::{
-    event_store_client::EventStoreClient, subscribe_request::StartFrom, AcknowledgeRequest,
-    EventBatch, SubscribeRequest,
+use eventus::server::{
+    eventstore::{
+        event_store_client::EventStoreClient, subscribe_request::StartFrom, AcknowledgeRequest,
+        EventBatch, SubscribeRequest,
+    },
+    ClientAuthInterceptor,
 };
 use futures::{Future, StreamExt};
 use kameo::{
@@ -11,7 +14,7 @@ use kameo::{
     messages, Actor,
 };
 use thiserror::Error;
-use tonic::{transport::Channel, Code, Status};
+use tonic::{service::interceptor::InterceptedService, transport::Channel, Code, Status};
 
 use crate::{Entity, Event};
 
@@ -120,12 +123,12 @@ pub enum EventHandlerError<E> {
     AcknowledgeFailed(#[from] SendError<Acknowledge>),
     #[error(transparent)]
     Grpc(#[from] Status),
-    #[error(transparent)]
+    #[error("{0}")]
     Handler(E),
 }
 
 pub async fn start_event_handler<E, T>(
-    mut client: EventStoreClient<Channel>,
+    mut client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
     mut state: T,
 ) -> Result<(), EventHandlerError<T::Error>>
 where
@@ -180,7 +183,7 @@ where
 }
 
 struct Acknowledger {
-    client: EventStoreClient<Channel>,
+    client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
     subscriber_id: String,
     last_event_id: u64,
     dirty: bool,
