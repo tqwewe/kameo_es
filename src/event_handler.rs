@@ -25,17 +25,17 @@ pub enum Acknowledgement {
     Manual,
 }
 
-pub trait EventHandlerBehaviour {
+pub trait EventHandlerBehaviour: Send {
     type Error;
 
     /// Where to start streaming events from.
-    fn start_from(&self) -> impl Future<Output = Result<StartFrom, Self::Error>>;
+    fn start_from(&self) -> impl Future<Output = Result<StartFrom, Self::Error>> + Send;
 
     /// Fallback when no entities were matched.
     fn fallback(
         &mut self,
         event: Event<()>,
-    ) -> impl Future<Output = Result<Acknowledgement, Self::Error>>;
+    ) -> impl Future<Output = Result<Acknowledgement, Self::Error>> + Send;
 
     /// How often to sync the last handled event id with eventus.
     ///
@@ -49,7 +49,7 @@ pub trait EventHandler<E>: EventHandlerBehaviour {
     fn handle(
         &mut self,
         event: Event<E>,
-    ) -> impl Future<Output = Result<Acknowledgement, Self::Error>>;
+    ) -> impl Future<Output = Result<Acknowledgement, Self::Error>> + Send;
 }
 
 impl<T> EventHandler<()> for T
