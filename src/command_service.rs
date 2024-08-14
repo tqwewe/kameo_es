@@ -1,5 +1,6 @@
-use std::{any, collections::HashMap, fmt, marker::PhantomData, sync::Arc};
+use std::{any, collections::HashMap, fmt, marker::PhantomData, sync::Arc, time::Instant};
 
+use chrono::{DateTime, Utc};
 use eventus::{
     server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor},
     ExpectedVersion,
@@ -20,7 +21,7 @@ use crate::{
     error::ExecuteError,
     event_store::{new_event_store, EventStore},
     stream_id::StreamID,
-    Apply, Command, Entity,
+    Apply, Command, Entity, Event, Metadata,
 };
 
 /// The command service routes commands to spawned entity actors per stream id.
@@ -81,7 +82,7 @@ where
         command: Execute<E, C, E::Metadata>,
     ) -> impl Future<
         Output = Result<
-            Vec<E::Event>,
+            Vec<AppendedEvent<E::Event>>,
             SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
         >,
     >;
@@ -97,7 +98,10 @@ where
     async fn execute(
         cmd_service: &ActorRef<CommandService>,
         command: Execute<E, C, E::Metadata>,
-    ) -> Result<Vec<E::Event>, SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>> {
+    ) -> Result<
+        Vec<AppendedEvent<E::Event>>,
+        SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
+    > {
         cmd_service.ask(command).send().await
     }
 }
@@ -109,8 +113,10 @@ where
 {
     pub id: E::ID,
     pub command: C,
-    pub metadata: M,
+    pub metadata: Metadata<M>,
     pub expected_version: ExpectedVersion,
+    pub time: DateTime<Utc>,
+    pub executed_at: Instant,
     pub phantom: PhantomData<E>,
 }
 
@@ -125,14 +131,30 @@ where
         Execute {
             id,
             command,
-            metadata: M::default(),
+            metadata: Metadata::default(),
             expected_version: ExpectedVersion::Any,
+            time: Utc::now(),
+            executed_at: Instant::now(),
             phantom: PhantomData,
         }
     }
 
+    pub fn caused_by(mut self, event_id: u64, stream_id: StreamID, stream_version: u64) -> Self {
+        self.metadata.causation_event_id = Some(event_id);
+        self.metadata.causation_stream_id = Some(stream_id);
+        self.metadata.causation_stream_version = Some(stream_version);
+        self
+    }
+
+    pub fn caused_by_event<F, N>(mut self, event: &Event<F, N>) -> Self {
+        self.metadata.causation_event_id = Some(event.id);
+        self.metadata.causation_stream_id = Some(event.stream_id.clone());
+        self.metadata.causation_stream_version = Some(event.stream_version);
+        self
+    }
+
     pub fn metadata(mut self, metadata: M) -> Self {
-        self.metadata = metadata;
+        self.metadata = self.metadata.with_data(metadata);
         self
     }
 
@@ -140,6 +162,18 @@ where
         self.expected_version = expected;
         self
     }
+
+    pub fn current_time(mut self, time: DateTime<Utc>) -> Self {
+        self.time = time;
+        self
+    }
+}
+
+pub struct AppendedEvent<E> {
+    pub event: E,
+    pub event_id: u64,
+    pub stream_version: u64,
+    pub timestamp: DateTime<Utc>,
 }
 
 impl<E, C> Message<Execute<E, C, E::Metadata>> for CommandService
@@ -147,7 +181,7 @@ where
     E: Command<C> + Apply,
     C: Clone + Send + 'static,
 {
-    type Reply = DelegatedReply<Result<Vec<E::Event>, ExecuteError<E::Error>>>;
+    type Reply = DelegatedReply<Result<Vec<AppendedEvent<E::Event>>, ExecuteError<E::Error>>>;
 
     async fn handle(
         &mut self,
@@ -186,6 +220,8 @@ where
                         command: msg.command,
                         expected_version: msg.expected_version,
                         metadata: msg.metadata,
+                        time: msg.time,
+                        executed_at: msg.executed_at,
                     })
                     .forward(tx)
                     .await;
@@ -197,6 +233,8 @@ where
                         command: msg.command,
                         expected_version: msg.expected_version,
                         metadata: msg.metadata,
+                        time: msg.time,
+                        executed_at: msg.executed_at,
                     })
                     .send()
                     .await;

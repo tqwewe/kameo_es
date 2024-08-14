@@ -1,6 +1,8 @@
-use std::fmt;
+use std::{fmt, time::Instant};
 
-use crate::{Apply, Command, Entity};
+use chrono::Utc;
+
+use crate::{Apply, Command, Entity, Metadata};
 
 pub trait GivenEntity: Entity + Apply {
     fn given(events: impl Into<Vec<Self::Event>>) -> Given<Self>;
@@ -61,9 +63,18 @@ where
     where
         E::Event: fmt::Debug + PartialEq<E::Event>,
     {
+        let metadata = Metadata::default();
+        let ctx = crate::Context {
+            metadata: &metadata,
+            last_causation_event_id: None,
+            last_causation_stream_id: None,
+            last_causation_stream_version: None,
+            time: Utc::now(),
+            executed_at: Instant::now(),
+        };
         let true_events = self
             .entity
-            .handle(self.cmd)
+            .handle(self.cmd, ctx)
             .expect("expected command to succeed");
         let expected_events: Vec<_> = events.into();
         assert_eq!(&true_events, &expected_events, "wrong events returned");
@@ -79,9 +90,18 @@ where
         E::Event: fmt::Debug,
         E::Error: fmt::Debug + PartialEq<E::Error>,
     {
+        let metadata = Metadata::default();
+        let ctx = crate::Context {
+            metadata: &metadata,
+            last_causation_event_id: None,
+            last_causation_stream_id: None,
+            last_causation_stream_version: None,
+            time: Utc::now(),
+            executed_at: Instant::now(),
+        };
         let true_err = self
             .entity
-            .handle(self.cmd)
+            .handle(self.cmd, ctx)
             .expect_err("expected command to return an error");
         assert_eq!(true_err, err);
 
@@ -95,9 +115,18 @@ where
     where
         F: FnOnce(Vec<E::Event>),
     {
+        let metadata = Metadata::default();
+        let ctx = crate::Context {
+            metadata: &metadata,
+            last_causation_event_id: None,
+            last_causation_stream_id: None,
+            last_causation_stream_version: None,
+            time: Utc::now(),
+            executed_at: Instant::now(),
+        };
         let events = self
             .entity
-            .handle(self.cmd)
+            .handle(self.cmd, ctx)
             .expect("expected command to succeed");
         f(events.clone());
 

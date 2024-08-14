@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(batch) = stream.next().await {
         for event in batch? {
             // Handle the event
-            println!("{} - {}", event.id, event.event_name);
+            println!("{} - {}", event.id, event.name);
 
             // Acknowledge the event, updating the subscriber last event
             //

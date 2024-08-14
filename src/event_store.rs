@@ -17,6 +17,7 @@ use kameo::{
     message::{Context, Message},
     Actor,
 };
+use prost_types::Timestamp;
 use serde::{de::DeserializeOwned, Serialize};
 use tonic::{service::interceptor::InterceptedService, transport::Channel, Status};
 
@@ -97,6 +98,7 @@ pub struct AppendEvents<E, M> {
     pub events: Vec<E>,
     pub expected_version: ExpectedVersion,
     pub metadata: M,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Error)]
@@ -111,6 +113,8 @@ pub enum AppendEventsError<M> {
         expected: ExpectedVersion,
         metadata: M,
     },
+    #[error("invalid timestamp")]
+    InvalidTimestamp,
     #[error(transparent)]
     SerializeEvent(#[from] rmp_serde::encode::Error),
 }
@@ -132,6 +136,7 @@ impl<M> fmt::Debug for AppendEventsError<M> {
                 .field("current", current)
                 .field("expected", expected)
                 .finish(),
+            Self::InvalidTimestamp => f.debug_struct("InvalidTimestamp").finish(),
             Self::SerializeEvent(arg0) => f.debug_tuple("SerializeEvent").field(arg0).finish(),
         }
     }
@@ -166,6 +171,14 @@ where
             stream_id: msg.stream_name.into_inner(),
             expected_version: Some(msg.expected_version.into()),
             events,
+            timestamp: Some(Timestamp {
+                seconds: msg.timestamp.timestamp(),
+                nanos: msg
+                    .timestamp
+                    .timestamp_subsec_nanos()
+                    .try_into()
+                    .map_err(|_| AppendEventsError::InvalidTimestamp)?,
+            }),
         };
 
         let res = self.client.append_to_stream(req).await?.into_inner();

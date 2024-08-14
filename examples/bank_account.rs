@@ -1,15 +1,20 @@
 use anyhow::bail;
-use eventus::server::eventstore::event_store_client::EventStoreClient;
+use eventus::server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor};
 use kameo_es::{
     command_service::{CommandService, Execute, ExecuteExt},
     Apply, Command, Entity, EventType,
 };
 
 use serde::{Deserialize, Serialize};
+use tonic::transport::Channel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = EventStoreClient::connect("http://[::1]:9220").await?;
+    let channel = Channel::builder("http://[::1]:9220".parse()?)
+        .connect()
+        .await?;
+    let client =
+        EventStoreClient::with_interceptor(channel, ClientAuthInterceptor::new("localhost")?);
     let cmd_service = kameo::spawn(CommandService::new(client));
 
     BankAccount::execute(

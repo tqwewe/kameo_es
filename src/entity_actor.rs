@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
-use eventus::{CurrentVersion, Event, ExpectedVersion};
+use chrono::{DateTime, Utc};
+use eventus::{CurrentVersion, ExpectedVersion};
 use futures::StreamExt;
 use kameo::{
     actor::{ActorRef, BoundedMailbox, WorkerMsg},
@@ -13,14 +14,18 @@ use tonic::Status;
 use tracing::debug;
 
 use crate::{
+    command_service::AppendedEvent,
     error::ExecuteError,
     event_store::{AppendEvents, AppendEventsError, EventStore, GetStreamEvents},
     stream_id::StreamID,
-    Apply, Command, Entity,
+    Apply, Command, Entity, GenericValue, Metadata,
 };
 
 pub struct EntityActor<E> {
     entity: E,
+    last_causation_event_id: Option<u64>,
+    last_causation_stream_id: Option<StreamID>,
+    last_causation_stream_version: Option<u64>,
     stream_id: StreamID,
     event_store: EventStore,
     version: CurrentVersion,
@@ -37,12 +42,50 @@ impl<E> EntityActor<E> {
     ) -> Self {
         EntityActor {
             entity,
+            last_causation_event_id: None,
+            last_causation_stream_id: None,
+            last_causation_stream_version: None,
             stream_id: stream_name,
             event_store,
             version: CurrentVersion::NoStream,
             conflict_reties: 3,
             notify,
         }
+    }
+
+    fn apply(
+        &mut self,
+        event: E::Event,
+        stream_version: u64,
+        causation_event_id: Option<u64>,
+        causation_stream_id: Option<StreamID>,
+        causation_stream_version: Option<u64>,
+    ) where
+        E: Entity + Apply,
+    {
+        assert_eq!(
+            match self.version {
+                CurrentVersion::Current(version) => version + 1,
+                CurrentVersion::NoStream => 0,
+            },
+            stream_version,
+            "expected stream version {} but got {} for stream {}",
+            match self.version {
+                CurrentVersion::Current(version) => version + 1,
+                CurrentVersion::NoStream => 0,
+            },
+            stream_version,
+            self.stream_id,
+        );
+        self.entity.apply(event);
+        self.version = CurrentVersion::Current(stream_version);
+        self.last_causation_event_id = self.last_causation_event_id.or(causation_event_id);
+        if let Some(causation_stream_id) = causation_stream_id {
+            self.last_causation_stream_id = Some(causation_stream_id);
+        }
+        self.last_causation_stream_version = self
+            .last_causation_stream_version
+            .or(causation_stream_version);
     }
 
     async fn resync_with_db(&mut self) -> Result<(), BoxError>
@@ -83,8 +126,15 @@ impl<E> EntityActor<E> {
                     event.stream_version,
                     event.stream_id,
                 );
-                self.entity.apply(rmp_serde::from_slice(&event.event_data)?);
-                self.version = CurrentVersion::Current(event.stream_version);
+                let ent_event = rmp_serde::from_slice(&event.event_data)?;
+                let metadata: Metadata<GenericValue> = rmp_serde::from_slice(&event.metadata)?;
+                self.apply(
+                    ent_event,
+                    event.stream_version,
+                    metadata.causation_event_id,
+                    metadata.causation_stream_id,
+                    metadata.causation_stream_version,
+                );
             }
         }
 
@@ -109,27 +159,29 @@ where
     }
 }
 
-impl<E> Message<Event<'static>> for EntityActor<E>
-where
-    E: Entity + Apply,
-{
-    type Reply = Result<(), rmp_serde::decode::Error>;
+// impl<E> Message<Event<'static>> for EntityActor<E>
+// where
+//     E: Entity + Apply,
+// {
+//     type Reply = Result<(), rmp_serde::decode::Error>;
 
-    async fn handle(
-        &mut self,
-        event: Event<'static>,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.entity.apply(rmp_serde::from_slice(&event.event_data)?);
-        Ok(())
-    }
-}
+//     async fn handle(
+//         &mut self,
+//         event: Event<'static>,
+//         _ctx: Context<'_, Self, Self::Reply>,
+//     ) -> Self::Reply {
+//         self.entity.apply(rmp_serde::from_slice(&event.event_data)?);
+//         Ok(())
+//     }
+// }
 
 pub struct Execute<I, C, M> {
     pub id: I,
     pub command: C,
-    pub metadata: M,
+    pub metadata: Metadata<M>,
     pub expected_version: ExpectedVersion,
+    pub time: DateTime<Utc>,
+    pub executed_at: Instant,
 }
 
 impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityActor<E>
@@ -137,7 +189,7 @@ where
     E: Entity + Command<C> + Apply,
     C: Clone + Send,
 {
-    type Reply = Result<Vec<E::Event>, ExecuteError<E::Error>>;
+    type Reply = Result<Vec<AppendedEvent<E::Event>>, ExecuteError<E::Error>>;
 
     async fn handle(
         &mut self,
@@ -145,8 +197,12 @@ where
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let mut metadata = msg.metadata;
+        let causation_event_id = metadata.causation_event_id;
+        let causation_stream_id = metadata.causation_stream_id.clone();
+        let causation_stream_version = metadata.causation_stream_version;
+
         let mut attempt = 1;
-        let events = loop {
+        let (starting_event_id, timestamp, events) = loop {
             if msg.expected_version.validate(self.version).is_err() {
                 return Err(ExecuteError::IncorrectExpectedVersion {
                     category: E::name().into(),
@@ -156,9 +212,21 @@ where
                 });
             }
 
+            let ctx = crate::Context {
+                metadata: &metadata,
+                last_causation_event_id: self.last_causation_event_id,
+                last_causation_stream_id: self.last_causation_stream_id.as_ref(),
+                last_causation_stream_version: self.last_causation_stream_version,
+                time: msg.time,
+                executed_at: msg.executed_at,
+            };
+            let is_idempotent = self.entity.is_idempotent(&msg.command, ctx);
+            if is_idempotent {
+                return Err(ExecuteError::IdempotencyViolation);
+            }
             let events = self
                 .entity
-                .handle(msg.command.clone())
+                .handle(msg.command.clone(), ctx)
                 .map_err(ExecuteError::Handle)?;
             let res = self
                 .event_store
@@ -167,13 +235,14 @@ where
                     events: events.clone(),
                     expected_version: self.version.as_expected_version(),
                     metadata,
+                    timestamp: msg.time,
                 }))
                 .send()
                 .await
                 .map_err(|err| err.map_msg(|msg| msg.0));
             match res {
-                Ok(_) => {
-                    break events;
+                Ok((starting_event_id, timestamp)) => {
+                    break (starting_event_id, timestamp, events);
                 }
                 Err(SendError::HandlerError(AppendEventsError::IncorrectExpectedVersion {
                     category,
@@ -201,18 +270,33 @@ where
             }
         };
 
-        for event in events.clone() {
-            self.entity.apply(event);
+        let starting_version = match self.version {
+            CurrentVersion::Current(v) => v + 1,
+            CurrentVersion::NoStream => 0,
+        };
+        let mut version = starting_version;
+
+        for event in &events {
+            self.apply(
+                event.clone(),
+                version,
+                causation_event_id,
+                causation_stream_id.clone(),
+                causation_stream_version,
+            );
+            version += 1;
         }
 
-        match &mut self.version {
-            CurrentVersion::Current(version) => *version += events.len() as u64,
-            CurrentVersion::NoStream => {
-                self.version = CurrentVersion::Current((events.len() as u64).saturating_sub(1))
-            }
-        }
-
-        Ok(events)
+        Ok(events
+            .into_iter()
+            .enumerate()
+            .map(|(i, event)| AppendedEvent {
+                event,
+                event_id: starting_event_id + i as u64,
+                stream_version: starting_version + i as u64,
+                timestamp,
+            })
+            .collect())
     }
 }
 
@@ -232,6 +316,7 @@ impl<E, M> From<AppendEventsError<M>> for ExecuteError<E> {
                 current,
                 expected,
             },
+            AppendEventsError::InvalidTimestamp => ExecuteError::InvalidTimestamp,
             AppendEventsError::SerializeEvent(err) => ExecuteError::SerializeEvent(err),
         }
     }

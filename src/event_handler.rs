@@ -26,7 +26,7 @@ pub enum Acknowledgement {
 }
 
 pub trait EventHandlerBehaviour: Send {
-    type Error;
+    type Error: Send;
 
     /// Where to start streaming events from.
     fn start_from(&self) -> impl Future<Output = Result<StartFrom, Self::Error>> + Send;
@@ -34,7 +34,7 @@ pub trait EventHandlerBehaviour: Send {
     /// Fallback when no entities were matched.
     fn fallback(
         &mut self,
-        event: Event<()>,
+        event: Event,
     ) -> impl Future<Output = Result<Acknowledgement, Self::Error>> + Send;
 
     /// How often to sync the last handled event id with eventus.
@@ -45,37 +45,72 @@ pub trait EventHandlerBehaviour: Send {
     }
 }
 
-pub trait EventHandler<E>: EventHandlerBehaviour {
+pub trait EventHandler<E>: EventHandlerBehaviour
+where
+    E: Entity,
+{
     fn handle(
         &mut self,
-        event: Event<E>,
+        id: E::ID,
+        event: Event<E::Event, E::Metadata>,
     ) -> impl Future<Output = Result<Acknowledgement, Self::Error>> + Send;
 }
 
-impl<T> EventHandler<()> for T
+pub trait CompositeEventHandler<E>: EventHandlerBehaviour {
+    fn handle(
+        &mut self,
+        event: Event,
+    ) -> impl Future<Output = Result<Acknowledgement, EventHandlerError<Self::Error>>> + Send;
+}
+
+impl<T> CompositeEventHandler<()> for T
 where
     T: EventHandlerBehaviour,
 {
-    async fn handle(&mut self, event: Event<()>) -> Result<Acknowledgement, Self::Error> {
-        self.fallback(event).await
+    async fn handle(
+        &mut self,
+        event: Event,
+    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
+        self.fallback(event)
+            .await
+            .map_err(EventHandlerError::Handler)
     }
 }
 
-impl<T, E1> EventHandler<(E1,)> for T
+impl<T, E1> CompositeEventHandler<(E1,)> for T
 where
     T: EventHandlerBehaviour + EventHandler<E1>,
     E1: Entity,
 {
-    async fn handle(&mut self, event: Event<(E1,)>) -> Result<Acknowledgement, Self::Error> {
+    async fn handle(
+        &mut self,
+        event: Event,
+    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
         if event.stream_id.category() == E1::name() {
-            return EventHandler::<E1>::handle(self, event.as_entity()).await;
+            return EventHandler::<E1>::handle(
+                self,
+                event.entity_id::<E1>().map_err(|_| {
+                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                })?,
+                event.as_entity::<E1>().map_err(|(event, err)| {
+                    EventHandlerError::DeserializeEvent {
+                        entity: E1::name(),
+                        event: event.name,
+                        err,
+                    }
+                })?,
+            )
+            .await
+            .map_err(EventHandlerError::Handler);
         }
 
-        self.fallback(event.as_entity()).await
+        self.fallback(event)
+            .await
+            .map_err(EventHandlerError::Handler)
     }
 }
 
-impl<T, E1, E2> EventHandler<(E1, E2)> for T
+impl<T, E1, E2> CompositeEventHandler<(E1, E2)> for T
 where
     T: EventHandlerBehaviour,
     T: EventHandler<E1>,
@@ -83,18 +118,51 @@ where
     T: EventHandler<E2>,
     E2: Entity,
 {
-    async fn handle(&mut self, event: Event<(E1, E2)>) -> Result<Acknowledgement, Self::Error> {
+    async fn handle(
+        &mut self,
+        event: Event,
+    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
         if event.stream_id.category() == E1::name() {
-            return EventHandler::<E1>::handle(self, event.as_entity()).await;
+            return EventHandler::<E1>::handle(
+                self,
+                event.entity_id::<E1>().map_err(|_| {
+                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                })?,
+                event.as_entity::<E1>().map_err(|(event, err)| {
+                    EventHandlerError::DeserializeEvent {
+                        entity: E1::name(),
+                        event: event.name,
+                        err,
+                    }
+                })?,
+            )
+            .await
+            .map_err(EventHandlerError::Handler);
         } else if event.stream_id.category() == E2::name() {
-            return EventHandler::<E2>::handle(self, event.as_entity()).await;
+            return EventHandler::<E2>::handle(
+                self,
+                event.entity_id::<E2>().map_err(|_| {
+                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                })?,
+                event.as_entity::<E2>().map_err(|(event, err)| {
+                    EventHandlerError::DeserializeEvent {
+                        entity: E2::name(),
+                        event: event.name,
+                        err,
+                    }
+                })?,
+            )
+            .await
+            .map_err(EventHandlerError::Handler);
         }
 
-        self.fallback(event.as_entity()).await
+        self.fallback(event)
+            .await
+            .map_err(EventHandlerError::Handler)
     }
 }
 
-impl<T, E1, E2, E3> EventHandler<(E1, E2, E3)> for T
+impl<T, E1, E2, E3> CompositeEventHandler<(E1, E2, E3)> for T
 where
     T: EventHandlerBehaviour,
     T: EventHandler<E1>,
@@ -104,25 +172,80 @@ where
     T: EventHandler<E3>,
     E3: Entity,
 {
-    async fn handle(&mut self, event: Event<(E1, E2, E3)>) -> Result<Acknowledgement, Self::Error> {
+    async fn handle(
+        &mut self,
+        event: Event,
+    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
         if event.stream_id.category() == E1::name() {
-            return EventHandler::<E1>::handle(self, event.as_entity()).await;
+            return EventHandler::<E1>::handle(
+                self,
+                event.entity_id::<E1>().map_err(|_| {
+                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                })?,
+                event.as_entity::<E1>().map_err(|(event, err)| {
+                    EventHandlerError::DeserializeEvent {
+                        entity: E1::name(),
+                        event: event.name,
+                        err,
+                    }
+                })?,
+            )
+            .await
+            .map_err(EventHandlerError::Handler);
         } else if event.stream_id.category() == E2::name() {
-            return EventHandler::<E2>::handle(self, event.as_entity()).await;
+            return EventHandler::<E2>::handle(
+                self,
+                event.entity_id::<E2>().map_err(|_| {
+                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                })?,
+                event.as_entity::<E2>().map_err(|(event, err)| {
+                    EventHandlerError::DeserializeEvent {
+                        entity: E2::name(),
+                        event: event.name,
+                        err,
+                    }
+                })?,
+            )
+            .await
+            .map_err(EventHandlerError::Handler);
         } else if event.stream_id.category() == E3::name() {
-            return EventHandler::<E3>::handle(self, event.as_entity()).await;
+            return EventHandler::<E3>::handle(
+                self,
+                event.entity_id::<E3>().map_err(|_| {
+                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                })?,
+                event.as_entity::<E3>().map_err(|(event, err)| {
+                    EventHandlerError::DeserializeEvent {
+                        entity: E3::name(),
+                        event: event.name,
+                        err,
+                    }
+                })?,
+            )
+            .await
+            .map_err(EventHandlerError::Handler);
         }
 
-        self.fallback(event.as_entity()).await
+        self.fallback(event)
+            .await
+            .map_err(EventHandlerError::Handler)
     }
 }
 
-#[derive(Clone, Debug, Error)]
+#[derive(Debug, Error)]
 pub enum EventHandlerError<E> {
     #[error(transparent)]
     AcknowledgeFailed(#[from] SendError<Acknowledge>),
+    #[error("failed to deserialize event '{event}' for entity '{entity}': {err}")]
+    DeserializeEvent {
+        entity: &'static str,
+        event: String,
+        err: rmpv::ext::Error,
+    },
     #[error(transparent)]
     Grpc(#[from] Status),
+    #[error("failed to parse entity id: {0}")]
+    ParseID(String),
     #[error("{0}")]
     Handler(E),
 }
@@ -132,7 +255,7 @@ pub async fn start_event_handler<E, T>(
     mut state: T,
 ) -> Result<(), EventHandlerError<T::Error>>
 where
-    T: EventHandlerBehaviour + EventHandler<E>,
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
 {
     let acknowledger = OnceCell::new();
 
@@ -154,10 +277,7 @@ where
                 EventHandlerError::Grpc(Status::new(Code::Internal, "invalid timestamp received"))
             })?;
             let event_id = event.id;
-            let ack = state
-                .handle(event)
-                .await
-                .map_err(EventHandlerError::Handler)?;
+            let ack = state.handle(event).await?;
             match ack {
                 Acknowledgement::Eventus { subscriber_id } => {
                     let client = client.clone();

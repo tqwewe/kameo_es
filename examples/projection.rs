@@ -1,17 +1,23 @@
-use std::{collections::HashMap, convert::Infallible};
+use std::collections::HashMap;
 
-use eventus::server::eventstore::{
-    event_store_client::EventStoreClient, subscribe_request::StartFrom,
+use eventus::server::{
+    eventstore::{event_store_client::EventStoreClient, subscribe_request::StartFrom},
+    ClientAuthInterceptor,
 };
 use kameo_es::{
     event_handler::{start_event_handler, Acknowledgement, EventHandler, EventHandlerBehaviour},
     Entity, Event, EventType,
 };
 use serde::{Deserialize, Serialize};
+use tonic::transport::Channel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = EventStoreClient::connect("http://[::1]:9220").await?;
+    let channel = Channel::builder("http://[::1]:9220".parse()?)
+        .connect()
+        .await?;
+    let client =
+        EventStoreClient::with_interceptor(channel, ClientAuthInterceptor::new("localhost")?);
     start_event_handler::<(MyEntity,), _>(client, EventKindCounter::default()).await?;
 
     Ok(())
@@ -57,7 +63,7 @@ pub struct EventKindCounter {
 }
 
 impl EventHandlerBehaviour for EventKindCounter {
-    type Error = Infallible;
+    type Error = anyhow::Error;
 
     async fn start_from(&self) -> Result<StartFrom, Self::Error> {
         // This function might query a database for the last processed event id,
@@ -67,15 +73,18 @@ impl EventHandlerBehaviour for EventKindCounter {
         Ok(StartFrom::EventId(0))
     }
 
-    async fn fallback(&mut self, _event: Event<()>) -> Result<Acknowledgement, Self::Error> {
+    async fn fallback(&mut self, _event: Event) -> Result<Acknowledgement, Self::Error> {
         Ok(Acknowledgement::Manual)
     }
 }
 
 impl EventHandler<MyEntity> for EventKindCounter {
-    async fn handle(&mut self, event: Event<MyEntity>) -> Result<Acknowledgement, Self::Error> {
+    async fn handle(
+        &mut self,
+        event: Event<MyEntityEvent, ()>,
+    ) -> Result<Acknowledgement, Self::Error> {
         // Increment the counter for this event name
-        *self.events.entry(event.event_name).or_default() += 1;
+        *self.events.entry(event.name).or_default() += 1;
 
         // We'll print the event counts for debugging purposes
         let output = self

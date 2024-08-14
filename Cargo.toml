@@ -9,9 +9,12 @@ chrono = { version = "0.4", features = ["serde"] }
 eventus = { git = "https://github.com/tqwewe/eventus" }
 futures = "0.3.30"
 kameo = "0.9.0"
+prost-types = "0.13.1"
+rmpv = { version = "1.3.0", features = ["with-serde"] }
 rmp-serde = "1.3.0"
 serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "*"
 thiserror = "1.0.58"
 tokio = { version = "1.37.0", features = ["full"] }
-tonic = "0.11"
+tonic = "0.12"
 tracing = "0.1"

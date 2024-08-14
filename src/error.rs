@@ -24,6 +24,8 @@ pub enum ExecuteError<E> {
     EventStoreActorNotRunning,
     #[error("event store actor stopped")]
     EventStoreActorStopped,
+    #[error("idempotency violation")]
+    IdempotencyViolation,
     #[error(transparent)]
     SerializeEvent(#[from] rmp_serde::encode::Error),
     #[error("expected '{category}-{id}' version {expected} but got {current}")]
@@ -33,6 +35,8 @@ pub enum ExecuteError<E> {
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
+    #[error("invalid timestamp")]
+    InvalidTimestamp,
     #[error("too many write conflicts for stream '{category}-{id}'")]
     TooManyConflicts { category: &'static str, id: String },
 }
