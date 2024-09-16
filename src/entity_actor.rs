@@ -4,9 +4,11 @@ use chrono::{DateTime, Utc};
 use eventus::{CurrentVersion, ExpectedVersion};
 use futures::StreamExt;
 use kameo::{
-    actor::{ActorRef, BoundedMailbox, WorkerMsg},
+    actor::{ActorRef, WorkerMsg},
     error::{BoxError, SendError},
+    mailbox::bounded::BoundedMailbox,
     message::{Context, Message},
+    request::MessageSend,
     Actor,
 };
 use tokio::sync::Notify;
@@ -126,8 +128,9 @@ impl<E> EntityActor<E> {
                     event.stream_version,
                     event.stream_id,
                 );
-                let ent_event = rmp_serde::from_slice(&event.event_data)?;
-                let metadata: Metadata<GenericValue> = rmp_serde::from_slice(&event.metadata)?;
+                let ent_event = ciborium::from_reader(event.event_data.as_ref())?;
+                let metadata: Metadata<GenericValue> =
+                    ciborium::from_reader(event.metadata.as_ref())?;
                 self.apply(
                     ent_event,
                     event.stream_version,
@@ -330,7 +333,6 @@ impl<M, E, Me> From<SendError<M, AppendEventsError<Me>>> for ExecuteError<E> {
             SendError::MailboxFull(_) => unreachable!("sending is always awaited"),
             SendError::HandlerError(err) => err.into(),
             SendError::Timeout(_) => unreachable!("no timeouts are used in the event store"),
-            SendError::QueriesNotSupported => unreachable!("the event store is never queried"),
         }
     }
 }
@@ -343,7 +345,6 @@ impl<M, E> From<SendError<M, Status>> for ExecuteError<E> {
             SendError::MailboxFull(_) => unreachable!("sending is always awaited"),
             SendError::HandlerError(err) => err.into(),
             SendError::Timeout(_) => unreachable!("no timeouts are used in the event store"),
-            SendError::QueriesNotSupported => unreachable!("the event store is never queried"),
         }
     }
 }

@@ -1,4 +1,10 @@
-use std::{cell::OnceCell, time::Duration};
+use std::{
+    cell::OnceCell,
+    marker::PhantomData,
+    pin,
+    task::{self, ready},
+    time::Duration,
+};
 
 use eventus::server::{
     eventstore::{
@@ -7,14 +13,20 @@ use eventus::server::{
     },
     ClientAuthInterceptor,
 };
-use futures::{Future, StreamExt};
+use futures::{Future, Stream, StreamExt};
 use kameo::{
-    actor::{ActorRef, BoundedMailbox, WeakActorRef},
+    actor::{ActorRef, WeakActorRef},
     error::{ActorStopReason, BoxError, PanicError, SendError},
-    messages, Actor,
+    mailbox::bounded::BoundedMailbox,
+    messages,
+    request::MessageSend,
+    Actor,
 };
 use thiserror::Error;
-use tonic::{service::interceptor::InterceptedService, transport::Channel, Code, Status};
+use tokio_util::sync::ReusableBoxFuture;
+use tonic::{
+    service::interceptor::InterceptedService, transport::Channel, Code, Status, Streaming,
+};
 
 use crate::{Entity, Event};
 
@@ -240,7 +252,7 @@ pub enum EventHandlerError<E> {
     DeserializeEvent {
         entity: &'static str,
         event: String,
-        err: rmpv::ext::Error,
+        err: ciborium::value::Error,
     },
     #[error(transparent)]
     Grpc(#[from] Status),
@@ -248,6 +260,239 @@ pub enum EventHandlerError<E> {
     ParseID(String),
     #[error("{0}")]
     Handler(E),
+}
+
+pub struct EventHandlerStream<E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    pub client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+    pub state: T,
+    acknowledger: OnceCell<ActorRef<Acknowledger>>,
+    stream: Streaming<EventBatch>,
+    phantom: PhantomData<E>,
+}
+
+impl<E, T> EventHandlerStream<E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    pub async fn new(
+        mut client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        state: T,
+    ) -> Result<Self, EventHandlerError<T::Error>> {
+        let acknowledger = OnceCell::new();
+
+        let stream = client
+            .subscribe(SubscribeRequest {
+                start_from: Some(
+                    state
+                        .start_from()
+                        .await
+                        .map_err(EventHandlerError::Handler)?,
+                ),
+            })
+            .await?
+            .into_inner();
+
+        Ok(EventHandlerStream {
+            client,
+            state,
+            acknowledger,
+            stream,
+            phantom: PhantomData,
+        })
+    }
+
+    pub async fn next(&mut self) -> Option<Result<EventHandlerBatch<'_, E, T>, Status>> {
+        Some(
+            self.stream
+                .next()
+                .await?
+                .map(|batch| EventHandlerBatch { batch, state: self }),
+        )
+    }
+}
+
+pub struct EventHandlerBatch<'a, E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    batch: EventBatch,
+    state: &'a mut EventHandlerStream<E, T>,
+}
+
+impl<'a, E, T> EventHandlerBatch<'a, E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    pub async fn process(self) -> Result<(), EventHandlerError<T::Error>> {
+        let EventBatch { events } = self.batch;
+        for event in events {
+            let event = Event::try_from(event).map_err(|_| {
+                EventHandlerError::Grpc(Status::new(Code::Internal, "invalid timestamp received"))
+            })?;
+            let event_id = event.id;
+            let ack = self.state.state.handle(event).await?;
+            match ack {
+                Acknowledgement::Eventus { subscriber_id } => {
+                    let client = self.state.client.clone();
+                    self.state
+                        .acknowledger
+                        .get_or_init(move || {
+                            kameo::spawn(Acknowledger {
+                                client,
+                                subscriber_id,
+                                last_event_id: 0,
+                                dirty: false,
+                            })
+                        })
+                        .tell(Acknowledge { event_id })
+                        .send()
+                        .await?;
+                }
+                Acknowledgement::Manual => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct EventHandlerStreamOld<E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    fut: Option<
+        ReusableBoxFuture<
+            'static,
+            Option<Result<EventHandlerStreamState<T>, EventHandlerError<T::Error>>>,
+        >,
+    >,
+    phantom: PhantomData<E>,
+}
+
+impl<E, T> EventHandlerStreamOld<E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E> + 'static,
+    E: Unpin + 'static,
+{
+    pub async fn new(
+        mut client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        state: T,
+    ) -> Result<Self, EventHandlerError<T::Error>> {
+        let acknowledger = OnceCell::new();
+
+        let stream = client
+            .subscribe(SubscribeRequest {
+                start_from: Some(
+                    state
+                        .start_from()
+                        .await
+                        .map_err(EventHandlerError::Handler)?,
+                ),
+            })
+            .await?
+            .into_inner();
+
+        Ok(EventHandlerStreamOld {
+            fut: Some(ReusableBoxFuture::new(handle_next_event(
+                EventHandlerStreamState {
+                    client,
+                    state,
+                    acknowledger,
+                    stream,
+                },
+            ))),
+            phantom: PhantomData,
+        })
+    }
+}
+
+impl<E, T> Stream for EventHandlerStreamOld<E, T>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E> + 'static,
+    E: Unpin + 'static,
+{
+    type Item = Result<(), EventHandlerError<T::Error>>;
+
+    fn poll_next(
+        self: pin::Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match &mut this.fut {
+            Some(fut) => match ready!(fut.poll(cx)) {
+                Some(Ok(state)) => {
+                    fut.set(handle_next_event(state));
+                    return task::Poll::Ready(Some(Ok(())));
+                }
+                Some(Err(err)) => {
+                    this.fut = None;
+                    return task::Poll::Ready(Some(Err(err)));
+                }
+                None => {
+                    return task::Poll::Ready(None);
+                }
+            },
+            None => return task::Poll::Ready(None),
+        }
+    }
+}
+
+pub struct EventHandlerStreamState<T> {
+    client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+    state: T,
+    acknowledger: OnceCell<ActorRef<Acknowledger>>,
+    stream: Streaming<EventBatch>,
+}
+
+async fn handle_next_event<E, T>(
+    mut state: EventHandlerStreamState<T>,
+) -> Option<Result<EventHandlerStreamState<T>, EventHandlerError<T::Error>>>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    let res = state.stream.next().await?;
+    Some(handle_next_event_inner(res, state).await)
+}
+
+async fn handle_next_event_inner<E, T>(
+    res: Result<EventBatch, Status>,
+    mut state: EventHandlerStreamState<T>,
+) -> Result<EventHandlerStreamState<T>, EventHandlerError<T::Error>>
+where
+    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+{
+    let EventBatch { events } = res.map_err(EventHandlerError::Grpc)?;
+    for event in events {
+        let event = Event::try_from(event).map_err(|_| {
+            EventHandlerError::Grpc(Status::new(Code::Internal, "invalid timestamp received"))
+        })?;
+        let event_id = event.id;
+        let ack = state.state.handle(event).await?;
+        match ack {
+            Acknowledgement::Eventus { subscriber_id } => {
+                let client = state.client.clone();
+                state
+                    .acknowledger
+                    .get_or_init(move || {
+                        kameo::spawn(Acknowledger {
+                            client,
+                            subscriber_id,
+                            last_event_id: 0,
+                            dirty: false,
+                        })
+                    })
+                    .tell(Acknowledge { event_id })
+                    .send()
+                    .await?;
+            }
+            Acknowledgement::Manual => {}
+        }
+    }
+
+    Ok(state)
 }
 
 pub async fn start_event_handler<E, T>(

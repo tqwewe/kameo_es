@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
 
 use eventus::{CurrentVersion, ExpectedVersion};
 use thiserror::Error;
@@ -27,7 +27,7 @@ pub enum ExecuteError<E> {
     #[error("idempotency violation")]
     IdempotencyViolation,
     #[error(transparent)]
-    SerializeEvent(#[from] rmp_serde::encode::Error),
+    SerializeEvent(#[from] ciborium::ser::Error<io::Error>),
     #[error("expected '{category}-{id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
         category: Cow<'static, str>,

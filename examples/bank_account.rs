@@ -2,7 +2,7 @@ use anyhow::bail;
 use eventus::server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor};
 use kameo_es::{
     command_service::{CommandService, Execute, ExecuteExt},
-    Apply, Command, Entity, EventType,
+    Apply, Command, Context, Entity, EventType,
 };
 
 use serde::{Deserialize, Serialize};
@@ -73,7 +73,11 @@ pub struct Withdraw {
 impl Command<Withdraw> for BankAccount {
     type Error = anyhow::Error;
 
-    fn handle(&self, cmd: Withdraw) -> Result<Vec<Self::Event>, Self::Error> {
+    fn handle(
+        &self,
+        cmd: Withdraw,
+        _ctx: Context<'_, Self>,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
         if self.balance < cmd.amount as i64 {
             bail!("insufficient balance");
         }
@@ -92,7 +96,11 @@ pub struct Deposit {
 impl Command<Deposit> for BankAccount {
     type Error = anyhow::Error;
 
-    fn handle(&self, cmd: Deposit) -> Result<Vec<Self::Event>, Self::Error> {
+    fn handle(
+        &self,
+        cmd: Deposit,
+        _ctx: Context<'_, Self>,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
         Ok(vec![BankAccountEvent::MoneyDeposited {
             amount: cmd.amount,
         }])

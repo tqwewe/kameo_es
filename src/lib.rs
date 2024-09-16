@@ -6,9 +6,10 @@ mod event_store;
 pub mod stream_id;
 pub mod test_utils;
 
-use std::{convert::Infallible, fmt, ops, str::FromStr, time::Instant};
+use std::{convert::Infallible, fmt, io, ops, str::FromStr, time::Instant};
 
 use chrono::{DateTime, Utc};
+use ciborium::Value;
 use eventus::server::eventstore::{
     event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
     SubscribeRequest,
@@ -163,14 +164,13 @@ impl Event {
     #[inline]
     pub fn as_entity<E>(
         self,
-    ) -> Result<Event<E::Event, E::Metadata>, (Event<(), ()>, rmpv::ext::Error)>
+    ) -> Result<Event<E::Event, E::Metadata>, (Event<(), ()>, ciborium::value::Error)>
     where
         E: Entity,
     {
-        let data = match rmpv::ext::from_value(self.data.0) {
+        let data = match self.data.0.deserialized() {
             Ok(data) => data,
             Err(err) => {
-                println!("uh oh, no event");
                 return Err((
                     Event {
                         id: self.id,
@@ -190,7 +190,6 @@ impl Event {
                 ));
             }
         };
-        println!("GOT EVENT!!!!");
 
         let metadata = match self.metadata.cast() {
             Ok(metadata) => metadata,
@@ -242,9 +241,9 @@ pub enum TryFromEventusEventError {
     #[error("invalid timestamp")]
     InvalidTimestamp,
     #[error("failed to deserialize event data: {0}")]
-    DeserializeEventData(rmp_serde::decode::Error),
+    DeserializeEventData(ciborium::de::Error<io::Error>),
     #[error("failed to deserialize event metadata: {0}")]
-    DeserializeEventMetadata(rmp_serde::decode::Error),
+    DeserializeEventMetadata(ciborium::de::Error<io::Error>),
 }
 
 impl<E, M> TryFrom<eventus::server::eventstore::Event> for Event<E, M>
@@ -260,9 +259,9 @@ where
             stream_id: StreamID::new(ev.stream_id),
             stream_version: ev.stream_version,
             name: ev.event_name,
-            data: rmp_serde::from_slice(&ev.event_data)
+            data: ciborium::from_reader(ev.event_data.as_slice())
                 .map_err(TryFromEventusEventError::DeserializeEventData)?,
-            metadata: rmp_serde::from_slice(&ev.metadata)
+            metadata: ciborium::from_reader(ev.metadata.as_slice())
                 .map_err(TryFromEventusEventError::DeserializeEventMetadata)?,
             timestamp: ev
                 .timestamp
@@ -298,7 +297,7 @@ impl<T> Metadata<T> {
 }
 
 impl Metadata<GenericValue> {
-    pub fn cast<U>(self) -> Result<Metadata<U>, rmpv::ext::Error>
+    pub fn cast<U>(self) -> Result<Metadata<U>, ciborium::value::Error>
     where
         U: DeserializeOwned + Default,
     {
@@ -306,10 +305,10 @@ impl Metadata<GenericValue> {
             causation_event_id: self.causation_event_id,
             causation_stream_id: self.causation_stream_id,
             causation_stream_version: self.causation_stream_version,
-            data: if matches!(self.data, GenericValue(rmpv::Value::Nil)) {
+            data: if matches!(self.data, GenericValue(Value::Null)) {
                 U::default()
             } else {
-                rmpv::ext::from_value(self.data.0)?
+                self.data.0.deserialized()?
             },
         })
     }
@@ -331,16 +330,16 @@ impl<T> ops::DerefMut for Metadata<T> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct GenericValue(pub rmpv::Value);
+pub struct GenericValue(pub Value);
 
 impl Default for GenericValue {
     fn default() -> Self {
-        GenericValue(rmpv::Value::Nil)
+        GenericValue(Value::Null)
     }
 }
 
 impl ops::Deref for GenericValue {
-    type Target = rmpv::Value;
+    type Target = Value;
 
     fn deref(&self) -> &Self::Target {
         &self.0

@@ -7,10 +7,12 @@ use eventus::{
 };
 use futures::Future;
 use kameo::{
-    actor::{ActorRef, BoundedMailbox},
+    actor::{ActorID, ActorRef},
     error::{ActorStopReason, BoxError, SendError},
+    mailbox::bounded::BoundedMailbox,
     message::{Context, Message},
     reply::DelegatedReply,
+    request::{ForwardMessageSend, MessageSend},
     Actor,
 };
 use tokio::sync::Notify;
@@ -27,7 +29,7 @@ use crate::{
 /// The command service routes commands to spawned entity actors per stream id.
 pub struct CommandService {
     event_store: EventStore,
-    entities: HashMap<StreamID, (u64, Box<dyn any::Any + Send + Sync + 'static>)>,
+    entities: HashMap<StreamID, (ActorID, Box<dyn any::Any + Send + Sync + 'static>)>,
 }
 
 impl CommandService {
@@ -64,7 +66,7 @@ impl Actor for CommandService {
     async fn on_link_died(
         &mut self,
         _actor_ref: kameo::actor::WeakActorRef<Self>,
-        id: u64,
+        id: ActorID,
         _reason: kameo::error::ActorStopReason,
     ) -> Result<Option<ActorStopReason>, BoxError> {
         self.entities
@@ -195,7 +197,7 @@ where
                 .cloned()
                 .unwrap(),
             None => {
-                let entity_ref = kameo::actor::spawn_unsync(EntityActor::new(
+                let entity_ref = kameo::actor::spawn(EntityActor::new(
                     E::default(),
                     stream_name.clone(),
                     self.event_store.clone(),

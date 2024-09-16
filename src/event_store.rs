@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, marker::PhantomData};
+use std::{fmt, future::Future, io, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
 use eventus::{
@@ -116,7 +116,7 @@ pub enum AppendEventsError<M> {
     #[error("invalid timestamp")]
     InvalidTimestamp,
     #[error(transparent)]
-    SerializeEvent(#[from] rmp_serde::encode::Error),
+    SerializeEvent(#[from] ciborium::ser::Error<io::Error>),
 }
 
 impl<M> fmt::Debug for AppendEventsError<M> {
@@ -154,19 +154,21 @@ where
         msg: AppendEvents<E, M>,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let metadata =
-            rmp_serde::to_vec_named(&msg.metadata).map_err(AppendEventsError::SerializeEvent)?;
+        let mut metadata = Vec::new();
+        ciborium::into_writer(&msg.metadata, &mut metadata)?;
         let events = msg
             .events
             .iter()
             .map(|event| {
+                let mut event_data = Vec::new();
+                ciborium::into_writer(&event, &mut event_data)?;
                 Ok(NewEvent {
                     event_name: event.event_type().to_string(),
-                    event_data: rmp_serde::to_vec_named(&event)?,
+                    event_data,
                     metadata: metadata.clone(),
                 })
             })
-            .collect::<Result<_, rmp_serde::encode::Error>>()?;
+            .collect::<Result<_, ciborium::ser::Error<io::Error>>>()?;
         let req = AppendToStreamRequest {
             stream_id: msg.stream_name.into_inner(),
             expected_version: Some(msg.expected_version.into()),

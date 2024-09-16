@@ -8,13 +8,14 @@ anyhow = "1.0.82"
 chrono = { version = "0.4", features = ["serde"] }
 eventus = { git = "https://github.com/tqwewe/eventus" }
 futures = "0.3.30"
-kameo = "0.9.0"
+kameo = "0.10" # { path = "../kameo" } # { git = "https://github.com/tqwewe/kameo", branch = "main" } # "0.9.0"
 prost-types = "0.13.1"
-rmpv = { version = "1.3.0", features = ["with-serde"] }
-rmp-serde = "1.3.0"
+# cbor4ii = { version = "0.3.3", features = ["serde1"] }
+ciborium = "0.2.2"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "*"
 thiserror = "1.0.58"
 tokio = { version = "1.37.0", features = ["full"] }
+tokio-util = "0.7.11"
 tonic = "0.12"
 tracing = "0.1"

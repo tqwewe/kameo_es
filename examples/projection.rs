@@ -81,6 +81,7 @@ impl EventHandlerBehaviour for EventKindCounter {
 impl EventHandler<MyEntity> for EventKindCounter {
     async fn handle(
         &mut self,
+        _id: String,
         event: Event<MyEntityEvent, ()>,
     ) -> Result<Acknowledgement, Self::Error> {
         // Increment the counter for this event name
