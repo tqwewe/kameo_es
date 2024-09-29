@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use eventus::server::{
-    eventstore::{event_store_client::EventStoreClient, subscribe_request::StartFrom},
-    ClientAuthInterceptor,
-};
+use eventus::server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor};
 use kameo_es::{
-    event_handler::{start_event_handler, Acknowledgement, EventHandler, EventHandlerBehaviour},
+    event_handler::{
+        in_memory::InMemoryEventProcessor, EntityEventHandler, EventHandler,
+        EventHandlerStreamBuilder,
+    },
     Entity, Event, EventType,
 };
 use serde::{Deserialize, Serialize};
@@ -16,9 +16,16 @@ async fn main() -> anyhow::Result<()> {
     let channel = Channel::builder("http://[::1]:9220".parse()?)
         .connect()
         .await?;
-    let client =
+    let mut client =
         EventStoreClient::with_interceptor(channel, ClientAuthInterceptor::new("localhost")?);
-    start_event_handler::<(MyEntity,), _>(client, EventKindCounter::default()).await?;
+
+    <(MyEntity,)>::event_handler_stream(
+        &mut client,
+        InMemoryEventProcessor::new(EventKindCounter::default()),
+    )
+    .await?
+    .run()
+    .await?;
 
     Ok(())
 }
@@ -62,28 +69,17 @@ pub struct EventKindCounter {
     events: HashMap<String, u32>,
 }
 
-impl EventHandlerBehaviour for EventKindCounter {
+impl EventHandler<()> for EventKindCounter {
     type Error = anyhow::Error;
-
-    async fn start_from(&self) -> Result<StartFrom, Self::Error> {
-        // This function might query a database for the last processed event id,
-        // or simply return StartFrom::SubscriberId to load from the last acknowledged event.
-        //
-        // In this example, we'll just start from 0 every time, since we're projecting only in-memory.
-        Ok(StartFrom::EventId(0))
-    }
-
-    async fn fallback(&mut self, _event: Event) -> Result<Acknowledgement, Self::Error> {
-        Ok(Acknowledgement::Manual)
-    }
 }
 
-impl EventHandler<MyEntity> for EventKindCounter {
+impl EntityEventHandler<MyEntity, ()> for EventKindCounter {
     async fn handle(
         &mut self,
+        _ctx: &mut (),
         _id: String,
         event: Event<MyEntityEvent, ()>,
-    ) -> Result<Acknowledgement, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Increment the counter for this event name
         *self.events.entry(event.name).or_default() += 1;
 
@@ -96,7 +92,6 @@ impl EventHandler<MyEntity> for EventKindCounter {
             .join(", ");
         println!("{output}");
 
-        // Indicate that we're handling acknowledgements manually
-        Ok(Acknowledgement::Manual)
+        Ok(())
     }
 }

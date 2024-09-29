@@ -1,253 +1,116 @@
-use std::{
-    cell::OnceCell,
-    marker::PhantomData,
-    pin,
-    task::{self, ready},
-    time::Duration,
-};
+pub mod file;
+pub mod in_memory;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
+
+use std::{marker::PhantomData, pin, task};
 
 use eventus::server::{
     eventstore::{
-        event_store_client::EventStoreClient, subscribe_request::StartFrom, AcknowledgeRequest,
-        EventBatch, SubscribeRequest,
+        event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
+        SubscribeRequest,
     },
     ClientAuthInterceptor,
 };
-use futures::{Future, Stream, StreamExt};
-use kameo::{
-    actor::{ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, PanicError, SendError},
-    mailbox::bounded::BoundedMailbox,
-    messages,
-    request::MessageSend,
-    Actor,
-};
+use futures::{ready, Future, Stream, StreamExt, TryStreamExt};
 use thiserror::Error;
 use tokio_util::sync::ReusableBoxFuture;
 use tonic::{
     service::interceptor::InterceptedService, transport::Channel, Code, Status, Streaming,
 };
+use tracing::info;
 
 use crate::{Entity, Event};
 
-pub enum Acknowledgement {
-    /// Saves the last handled event id in eventus.
-    Eventus { subscriber_id: String },
-    /// The last handled event id is stored manually.
-    Manual,
-}
-
-pub trait EventHandlerBehaviour: Send {
+pub trait EventProcessor<E, H>
+where
+    Self: Send,
+    H: EventHandler<Self::Context>,
+{
+    type Context: Send;
     type Error: Send;
 
-    /// Where to start streaming events from.
-    fn start_from(&self) -> impl Future<Output = Result<StartFrom, Self::Error>> + Send;
+    /// Which event to start streaming from.
+    fn start_from(&self) -> impl Future<Output = Result<u64, Self::Error>>;
 
-    /// Fallback when no entities were matched.
-    fn fallback(
+    /// Processes an event, which should internally call the event handler.
+    fn process_event(
         &mut self,
         event: Event,
-    ) -> impl Future<Output = Result<Acknowledgement, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), EventHandlerError<Self::Error, H::Error>>> + Send;
+}
 
-    /// How often to sync the last handled event id with eventus.
-    ///
-    /// Defaults to every 2 seconds.
-    fn acknowledge_eventus_interval() -> Duration {
-        Duration::from_secs(2)
+/// An event handler.
+pub trait EventHandler<C>: Send {
+    type Error: Send;
+
+    /// Handles an event, typically as a fallback when no entities were matched.
+    fn handle(
+        &mut self,
+        _ctx: &mut C,
+        _event: Event,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move { Ok(()) }
     }
 }
 
-pub trait EventHandler<E>: EventHandlerBehaviour
+/// An event handler for an entity.
+pub trait EntityEventHandler<E, C>: EventHandler<C>
 where
     E: Entity,
 {
+    /// Handles an event for an entity.
     fn handle(
         &mut self,
+        ctx: &mut C,
         id: E::ID,
         event: Event<E::Event, E::Metadata>,
-    ) -> impl Future<Output = Result<Acknowledgement, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-pub trait CompositeEventHandler<E>: EventHandlerBehaviour {
-    fn handle(
-        &mut self,
-        event: Event,
-    ) -> impl Future<Output = Result<Acknowledgement, EventHandlerError<Self::Error>>> + Send;
-}
-
-impl<T> CompositeEventHandler<()> for T
+/// A trait for handling events based on a tuple of entities, where each entity is checked against the event category
+/// in order until a match is found, which will then be handled using the `EntityEventHandler`.
+pub trait CompositeEventHandler<E, C, PE>
 where
-    T: EventHandlerBehaviour,
+    Self: EventHandler<C> + Sized,
 {
-    async fn handle(
+    /// Handles an event, determining which entity it belongs to, falling back to the `EventHandler` implementation.
+    fn composite_handle(
         &mut self,
+        ctx: &mut C,
         event: Event,
-    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
-        self.fallback(event)
-            .await
-            .map_err(EventHandlerError::Handler)
+    ) -> impl Future<Output = Result<(), EventHandlerError<PE, Self::Error>>> + Send;
+}
+
+/// A helper trait for creating an event handler stream.
+pub trait EventHandlerStreamBuilder: Sized + 'static {
+    fn event_handler_stream<P, H>(
+        client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        processor: P,
+    ) -> impl Future<
+        Output = Result<EventHandlerStream<Self, P, H>, EventHandlerError<P::Error, H::Error>>,
+    >
+    where
+        P: EventProcessor<Self, H> + 'static,
+        H: EventHandler<P::Context> + 'static;
+}
+
+impl<E: 'static> EventHandlerStreamBuilder for E {
+    async fn event_handler_stream<P, H>(
+        client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        processor: P,
+    ) -> Result<EventHandlerStream<Self, P, H>, EventHandlerError<P::Error, H::Error>>
+    where
+        P: EventProcessor<Self, H> + 'static,
+        H: EventHandler<P::Context> + 'static,
+    {
+        EventHandlerStream::new(client, processor).await
     }
 }
 
-impl<T, E1> CompositeEventHandler<(E1,)> for T
-where
-    T: EventHandlerBehaviour + EventHandler<E1>,
-    E1: Entity,
-{
-    async fn handle(
-        &mut self,
-        event: Event,
-    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
-        if event.stream_id.category() == E1::name() {
-            return EventHandler::<E1>::handle(
-                self,
-                event.entity_id::<E1>().map_err(|_| {
-                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
-                })?,
-                event.as_entity::<E1>().map_err(|(event, err)| {
-                    EventHandlerError::DeserializeEvent {
-                        entity: E1::name(),
-                        event: event.name,
-                        err,
-                    }
-                })?,
-            )
-            .await
-            .map_err(EventHandlerError::Handler);
-        }
-
-        self.fallback(event)
-            .await
-            .map_err(EventHandlerError::Handler)
-    }
-}
-
-impl<T, E1, E2> CompositeEventHandler<(E1, E2)> for T
-where
-    T: EventHandlerBehaviour,
-    T: EventHandler<E1>,
-    E1: Entity,
-    T: EventHandler<E2>,
-    E2: Entity,
-{
-    async fn handle(
-        &mut self,
-        event: Event,
-    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
-        if event.stream_id.category() == E1::name() {
-            return EventHandler::<E1>::handle(
-                self,
-                event.entity_id::<E1>().map_err(|_| {
-                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
-                })?,
-                event.as_entity::<E1>().map_err(|(event, err)| {
-                    EventHandlerError::DeserializeEvent {
-                        entity: E1::name(),
-                        event: event.name,
-                        err,
-                    }
-                })?,
-            )
-            .await
-            .map_err(EventHandlerError::Handler);
-        } else if event.stream_id.category() == E2::name() {
-            return EventHandler::<E2>::handle(
-                self,
-                event.entity_id::<E2>().map_err(|_| {
-                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
-                })?,
-                event.as_entity::<E2>().map_err(|(event, err)| {
-                    EventHandlerError::DeserializeEvent {
-                        entity: E2::name(),
-                        event: event.name,
-                        err,
-                    }
-                })?,
-            )
-            .await
-            .map_err(EventHandlerError::Handler);
-        }
-
-        self.fallback(event)
-            .await
-            .map_err(EventHandlerError::Handler)
-    }
-}
-
-impl<T, E1, E2, E3> CompositeEventHandler<(E1, E2, E3)> for T
-where
-    T: EventHandlerBehaviour,
-    T: EventHandler<E1>,
-    E1: Entity,
-    T: EventHandler<E2>,
-    E2: Entity,
-    T: EventHandler<E3>,
-    E3: Entity,
-{
-    async fn handle(
-        &mut self,
-        event: Event,
-    ) -> Result<Acknowledgement, EventHandlerError<Self::Error>> {
-        if event.stream_id.category() == E1::name() {
-            return EventHandler::<E1>::handle(
-                self,
-                event.entity_id::<E1>().map_err(|_| {
-                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
-                })?,
-                event.as_entity::<E1>().map_err(|(event, err)| {
-                    EventHandlerError::DeserializeEvent {
-                        entity: E1::name(),
-                        event: event.name,
-                        err,
-                    }
-                })?,
-            )
-            .await
-            .map_err(EventHandlerError::Handler);
-        } else if event.stream_id.category() == E2::name() {
-            return EventHandler::<E2>::handle(
-                self,
-                event.entity_id::<E2>().map_err(|_| {
-                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
-                })?,
-                event.as_entity::<E2>().map_err(|(event, err)| {
-                    EventHandlerError::DeserializeEvent {
-                        entity: E2::name(),
-                        event: event.name,
-                        err,
-                    }
-                })?,
-            )
-            .await
-            .map_err(EventHandlerError::Handler);
-        } else if event.stream_id.category() == E3::name() {
-            return EventHandler::<E3>::handle(
-                self,
-                event.entity_id::<E3>().map_err(|_| {
-                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
-                })?,
-                event.as_entity::<E3>().map_err(|(event, err)| {
-                    EventHandlerError::DeserializeEvent {
-                        entity: E3::name(),
-                        event: event.name,
-                        err,
-                    }
-                })?,
-            )
-            .await
-            .map_err(EventHandlerError::Handler);
-        }
-
-        self.fallback(event)
-            .await
-            .map_err(EventHandlerError::Handler)
-    }
-}
-
+/// An error which occurs when handling an event.
 #[derive(Debug, Error)]
-pub enum EventHandlerError<E> {
-    #[error(transparent)]
-    AcknowledgeFailed(#[from] SendError<Acknowledge>),
+pub enum EventHandlerError<P, H> {
     #[error("failed to deserialize event '{event}' for entity '{entity}': {err}")]
     DeserializeEvent {
         entity: &'static str,
@@ -259,346 +122,207 @@ pub enum EventHandlerError<E> {
     #[error("failed to parse entity id: {0}")]
     ParseID(String),
     #[error("{0}")]
-    Handler(E),
+    Processor(P),
+    #[error("{0}")]
+    Handler(H),
 }
 
-pub struct EventHandlerStream<E, T>
+/// A stream which processes events using an `EventProcessor`.
+pub struct EventHandlerStream<E, P, H>
 where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+    P: EventProcessor<E, H>,
+    H: EventHandler<P::Context>,
 {
-    pub client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-    pub state: T,
-    acknowledger: OnceCell<ActorRef<Acknowledger>>,
-    stream: Streaming<EventBatch>,
-    phantom: PhantomData<E>,
+    next_fut: ReusableBoxFuture<
+        'static,
+        (
+            P,
+            Streaming<EventBatch>,
+            Option<Result<(), EventHandlerError<P::Error, H::Error>>>,
+        ),
+    >,
+    phantom: PhantomData<(E, H)>,
 }
 
-impl<E, T> EventHandlerStream<E, T>
+impl<E, P, H> EventHandlerStream<E, P, H>
 where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+    E: 'static,
+    P: EventProcessor<E, H> + 'static,
+    H: EventHandler<P::Context> + 'static,
 {
-    pub async fn new(
-        mut client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-        state: T,
-    ) -> Result<Self, EventHandlerError<T::Error>> {
-        let acknowledger = OnceCell::new();
-
+    async fn new(
+        client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        processor: P,
+    ) -> Result<Self, EventHandlerError<P::Error, H::Error>> {
         let stream = client
             .subscribe(SubscribeRequest {
-                start_from: Some(
-                    state
+                start_from: Some(StartFrom::EventId(
+                    processor
                         .start_from()
                         .await
-                        .map_err(EventHandlerError::Handler)?,
-                ),
+                        .map_err(EventHandlerError::Processor)?,
+                )),
             })
             .await?
             .into_inner();
 
         Ok(EventHandlerStream {
-            client,
-            state,
-            acknowledger,
-            stream,
+            next_fut: ReusableBoxFuture::new(event_handler_stream_next(processor, stream)),
             phantom: PhantomData,
         })
     }
 
-    pub async fn next(&mut self) -> Option<Result<EventHandlerBatch<'_, E, T>, Status>> {
-        Some(
-            self.stream
-                .next()
-                .await?
-                .map(|batch| EventHandlerBatch { batch, state: self }),
-        )
+    pub async fn run(self) -> Result<(), EventHandlerError<P::Error, H::Error>>
+    where
+        E: Unpin + 'static,
+        P: EventProcessor<E, H> + Unpin + 'static,
+        H: EventHandler<P::Context> + Unpin + 'static,
+    {
+        self.try_collect().await
     }
 }
 
-pub struct EventHandlerBatch<'a, E, T>
+impl<E, P, H> Stream for EventHandlerStream<E, P, H>
 where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
-{
-    batch: EventBatch,
-    state: &'a mut EventHandlerStream<E, T>,
-}
-
-impl<'a, E, T> EventHandlerBatch<'a, E, T>
-where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
-{
-    pub async fn process(self) -> Result<(), EventHandlerError<T::Error>> {
-        let EventBatch { events } = self.batch;
-        for event in events {
-            let event = Event::try_from(event).map_err(|_| {
-                EventHandlerError::Grpc(Status::new(Code::Internal, "invalid timestamp received"))
-            })?;
-            let event_id = event.id;
-            let ack = self.state.state.handle(event).await?;
-            match ack {
-                Acknowledgement::Eventus { subscriber_id } => {
-                    let client = self.state.client.clone();
-                    self.state
-                        .acknowledger
-                        .get_or_init(move || {
-                            kameo::spawn(Acknowledger {
-                                client,
-                                subscriber_id,
-                                last_event_id: 0,
-                                dirty: false,
-                            })
-                        })
-                        .tell(Acknowledge { event_id })
-                        .send()
-                        .await?;
-                }
-                Acknowledgement::Manual => {}
-            }
-        }
-
-        Ok(())
-    }
-}
-
-pub struct EventHandlerStreamOld<E, T>
-where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
-{
-    fut: Option<
-        ReusableBoxFuture<
-            'static,
-            Option<Result<EventHandlerStreamState<T>, EventHandlerError<T::Error>>>,
-        >,
-    >,
-    phantom: PhantomData<E>,
-}
-
-impl<E, T> EventHandlerStreamOld<E, T>
-where
-    T: EventHandlerBehaviour + CompositeEventHandler<E> + 'static,
     E: Unpin + 'static,
+    P: EventProcessor<E, H> + Unpin + 'static,
+    H: EventHandler<P::Context> + Unpin + 'static,
 {
-    pub async fn new(
-        mut client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-        state: T,
-    ) -> Result<Self, EventHandlerError<T::Error>> {
-        let acknowledger = OnceCell::new();
-
-        let stream = client
-            .subscribe(SubscribeRequest {
-                start_from: Some(
-                    state
-                        .start_from()
-                        .await
-                        .map_err(EventHandlerError::Handler)?,
-                ),
-            })
-            .await?
-            .into_inner();
-
-        Ok(EventHandlerStreamOld {
-            fut: Some(ReusableBoxFuture::new(handle_next_event(
-                EventHandlerStreamState {
-                    client,
-                    state,
-                    acknowledger,
-                    stream,
-                },
-            ))),
-            phantom: PhantomData,
-        })
-    }
-}
-
-impl<E, T> Stream for EventHandlerStreamOld<E, T>
-where
-    T: EventHandlerBehaviour + CompositeEventHandler<E> + 'static,
-    E: Unpin + 'static,
-{
-    type Item = Result<(), EventHandlerError<T::Error>>;
+    type Item = Result<(), EventHandlerError<P::Error, H::Error>>;
 
     fn poll_next(
         self: pin::Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match &mut this.fut {
-            Some(fut) => match ready!(fut.poll(cx)) {
-                Some(Ok(state)) => {
-                    fut.set(handle_next_event(state));
-                    return task::Poll::Ready(Some(Ok(())));
-                }
-                Some(Err(err)) => {
-                    this.fut = None;
-                    return task::Poll::Ready(Some(Err(err)));
-                }
-                None => {
-                    return task::Poll::Ready(None);
-                }
-            },
-            None => return task::Poll::Ready(None),
-        }
+        let (processor, stream, res) = ready!(this.next_fut.poll(cx));
+        this.next_fut
+            .set(event_handler_stream_next(processor, stream));
+        cx.waker().wake_by_ref();
+
+        task::Poll::Ready(res)
     }
 }
 
-pub struct EventHandlerStreamState<T> {
-    client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-    state: T,
-    acknowledger: OnceCell<ActorRef<Acknowledger>>,
-    stream: Streaming<EventBatch>,
-}
-
-async fn handle_next_event<E, T>(
-    mut state: EventHandlerStreamState<T>,
-) -> Option<Result<EventHandlerStreamState<T>, EventHandlerError<T::Error>>>
+async fn event_handler_stream_next<E, P, H>(
+    mut processor: P,
+    mut stream: Streaming<EventBatch>,
+) -> (
+    P,
+    Streaming<EventBatch>,
+    Option<Result<(), EventHandlerError<P::Error, H::Error>>>,
+)
 where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
+    P: EventProcessor<E, H>,
+    H: EventHandler<P::Context>,
 {
-    let res = state.stream.next().await?;
-    Some(handle_next_event_inner(res, state).await)
-}
-
-async fn handle_next_event_inner<E, T>(
-    res: Result<EventBatch, Status>,
-    mut state: EventHandlerStreamState<T>,
-) -> Result<EventHandlerStreamState<T>, EventHandlerError<T::Error>>
-where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
-{
-    let EventBatch { events } = res.map_err(EventHandlerError::Grpc)?;
-    for event in events {
-        let event = Event::try_from(event).map_err(|_| {
-            EventHandlerError::Grpc(Status::new(Code::Internal, "invalid timestamp received"))
-        })?;
-        let event_id = event.id;
-        let ack = state.state.handle(event).await?;
-        match ack {
-            Acknowledgement::Eventus { subscriber_id } => {
-                let client = state.client.clone();
-                state
-                    .acknowledger
-                    .get_or_init(move || {
-                        kameo::spawn(Acknowledger {
-                            client,
-                            subscriber_id,
-                            last_event_id: 0,
-                            dirty: false,
-                        })
-                    })
-                    .tell(Acknowledge { event_id })
-                    .send()
-                    .await?;
-            }
-            Acknowledgement::Manual => {}
-        }
-    }
-
-    Ok(state)
-}
-
-pub async fn start_event_handler<E, T>(
-    mut client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-    mut state: T,
-) -> Result<(), EventHandlerError<T::Error>>
-where
-    T: EventHandlerBehaviour + CompositeEventHandler<E>,
-{
-    let acknowledger = OnceCell::new();
-
-    let mut stream = client
-        .subscribe(SubscribeRequest {
-            start_from: Some(
-                state
-                    .start_from()
-                    .await
-                    .map_err(EventHandlerError::Handler)?,
-            ),
-        })
-        .await?
-        .into_inner();
-    while let Some(res) = stream.next().await {
-        let EventBatch { events } = res.map_err(EventHandlerError::Grpc)?;
-        for event in events {
-            let event = Event::try_from(event).map_err(|_| {
-                EventHandlerError::Grpc(Status::new(Code::Internal, "invalid timestamp received"))
-            })?;
-            let event_id = event.id;
-            let ack = state.handle(event).await?;
-            match ack {
-                Acknowledgement::Eventus { subscriber_id } => {
-                    let client = client.clone();
-                    acknowledger
-                        .get_or_init(move || {
-                            kameo::spawn(Acknowledger {
-                                client,
-                                subscriber_id,
-                                last_event_id: 0,
-                                dirty: false,
-                            })
-                        })
-                        .tell(Acknowledge { event_id })
-                        .send()
-                        .await?;
-                }
-                Acknowledgement::Manual => {}
-            }
-        }
-    }
-
-    Ok(())
-}
-
-struct Acknowledger {
-    client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-    subscriber_id: String,
-    last_event_id: u64,
-    dirty: bool,
-}
-
-impl Actor for Acknowledger {
-    type Mailbox = BoundedMailbox<Self>;
-
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let res = actor_ref.tell(Flush).send().await;
-                if let Err(SendError::ActorNotRunning(_)) = res {
-                    return;
+    match stream.next().await {
+        Some(Ok(EventBatch { events })) => {
+            for event in events {
+                let Ok(event) = Event::try_from(event) else {
+                    return (
+                        processor,
+                        stream,
+                        Some(Err(EventHandlerError::Grpc(Status::new(
+                            Code::Internal,
+                            "invalid timestamp received",
+                        )))),
+                    );
+                };
+                info!(
+                    "{} {:<32} {:>6} > {}",
+                    event.id, event.stream_id, event.stream_version, event.name
+                );
+                if let Err(err) = processor.process_event(event).await {
+                    return (processor, stream, Some(Err(err)));
                 }
             }
-        });
 
-        Ok(())
-    }
-
-    async fn on_panic(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _err: PanicError,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
-        Ok(None)
-    }
-}
-
-#[messages]
-impl Acknowledger {
-    #[message(derive(Clone))]
-    pub fn acknowledge(&mut self, event_id: u64) {
-        self.last_event_id = event_id;
-        self.dirty = true;
-    }
-
-    #[message]
-    async fn flush(&mut self) -> Result<(), Status> {
-        if self.dirty {
-            self.client
-                .acknowledge(AcknowledgeRequest {
-                    subscriber_id: self.subscriber_id.clone(),
-                    last_event_id: self.last_event_id,
-                })
-                .await?;
-            self.dirty = false;
+            (processor, stream, Some(Ok(())))
         }
-        Ok(())
+        Some(Err(status)) => (
+            processor,
+            stream,
+            Some(Err(EventHandlerError::Grpc(status))),
+        ),
+        None => (processor, stream, None),
     }
 }
+
+macro_rules! impl_composite_event_handler {
+    (
+        $( ( $( $ent:ident ),* ), )+
+    ) => {
+        $(
+            impl_composite_event_handler!( $( $ent ),* );
+        )+
+    };
+    ( $( $( $ent:ident ),+ )? ) => {
+        impl<H, C, PE $( , $( $ent ),+ )?> CompositeEventHandler<( $( $( $ent, )+ )? ), C, PE> for H
+        where
+            H: EventHandler<C> + Sized,
+            C: Send,
+            PE: Send,
+            $( $(
+                H: EntityEventHandler<$ent, C>,
+                $ent: Entity,
+            )+ )?
+        {
+            async fn composite_handle(
+                &mut self,
+                ctx: &mut C,
+                event: Event,
+            ) -> Result<(), EventHandlerError<PE, Self::Error>> {
+                $(
+                    let category = event.stream_id.category();
+                    $(
+                        if category == $ent::name() {
+                            EntityEventHandler::<$ent, C>::handle(
+                                self,
+                                ctx,
+                                event.entity_id::<$ent>().map_err(|_| {
+                                    EventHandlerError::ParseID(event.stream_id.cardinal_id().to_string())
+                                })?,
+                                event.as_entity::<$ent>().map_err(|(event, err)| {
+                                    EventHandlerError::DeserializeEvent {
+                                        entity: $ent::name(),
+                                        event: event.name,
+                                        err,
+                                    }
+                                })?,
+                            )
+                            .await
+                            .map_err(EventHandlerError::Handler)
+                        } else
+                    )+
+                )?
+
+                {
+                    EventHandler::handle(self, ctx, event)
+                        .await
+                        .map_err(EventHandlerError::Handler)
+                }
+            }
+        }
+    };
+}
+
+impl_composite_event_handler![
+    (),
+    (E1),
+    (E1, E2),
+    (E1, E2, E3),
+    (E1, E2, E3, E4),
+    (E1, E2, E3, E4, E5),
+    (E1, E2, E3, E4, E5, E6),
+    (E1, E2, E3, E4, E5, E6, E7),
+    (E1, E2, E3, E4, E5, E6, E7, E8),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15),
+    (E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16),
+];

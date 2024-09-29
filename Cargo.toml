@@ -5,13 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.82"
+# cbor4ii = { version = "0.3.3", features = ["serde1"] }
 chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2.2"
 eventus = { git = "https://github.com/tqwewe/eventus" }
 futures = "0.3.30"
-kameo = { git = "https://github.com/tqwewe/kameo", branch = "feat/multiaddr" }
+kameo = "0.11.0"
+mongodb = { version = "3.1.0", optional = true }
 prost-types = "0.13.1"
-# cbor4ii = { version = "0.3.3", features = ["serde1"] }
-ciborium = "0.2.2"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "*"
 thiserror = "1.0.58"
@@ -19,3 +20,8 @@ tokio = { version = "1.37.0", features = ["full"] }
 tokio-util = "0.7.11"
 tonic = "0.12"
 tracing = "0.1"
+
+[features]
+mongodb = [
+  "dep:mongodb"
+]
