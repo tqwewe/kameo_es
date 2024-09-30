@@ -1,3 +1,5 @@
+use std::ops;
+
 use mongodb::{
     bson::{bson, doc},
     Client, ClientSession, Collection,
@@ -15,10 +17,18 @@ pub struct Session {
     dirty: bool,
 }
 
-impl<'a> From<&'a mut Session> for &'a mut ClientSession {
-    fn from(session: &'a mut Session) -> Self {
-        session.dirty = true;
-        &mut session.session
+impl ops::Deref for Session {
+    type Target = ClientSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl ops::DerefMut for Session {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dirty = true;
+        &mut self.session
     }
 }
 
