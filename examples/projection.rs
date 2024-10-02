@@ -19,13 +19,10 @@ async fn main() -> anyhow::Result<()> {
     let mut client =
         EventStoreClient::with_interceptor(channel, ClientAuthInterceptor::new("localhost")?);
 
-    <(MyEntity,)>::event_handler_stream(
-        &mut client,
-        InMemoryEventProcessor::new(EventKindCounter::default()),
-    )
-    .await?
-    .run()
-    .await?;
+    let mut processor = InMemoryEventProcessor::new(EventKindCounter::default());
+
+    let mut stream = <(MyEntity,)>::event_handler_stream(&mut client, &mut processor).await?;
+    stream.run(&mut processor).await?;
 
     Ok(())
 }

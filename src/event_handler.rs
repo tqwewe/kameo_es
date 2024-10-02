@@ -85,22 +85,20 @@ where
 
 /// A helper trait for creating an event handler stream.
 pub trait EventHandlerStreamBuilder: Sized + 'static {
-    fn event_handler_stream<P, H>(
+    fn event_handler_stream<'a, P, H>(
         client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-        processor: P,
-    ) -> impl Future<
-        Output = Result<EventHandlerStream<Self, P, H>, EventHandlerError<P::Error, H::Error>>,
-    >
+        processor: &'a mut P,
+    ) -> impl Future<Output = Result<EventHandlerStream<Self>, EventHandlerError<P::Error, H::Error>>>
     where
         P: EventProcessor<Self, H> + 'static,
         H: EventHandler<P::Context> + 'static;
 }
 
 impl<E: 'static> EventHandlerStreamBuilder for E {
-    async fn event_handler_stream<P, H>(
+    async fn event_handler_stream<'a, P, H>(
         client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-        processor: P,
-    ) -> Result<EventHandlerStream<Self, P, H>, EventHandlerError<P::Error, H::Error>>
+        processor: &'a mut P,
+    ) -> Result<EventHandlerStream<Self>, EventHandlerError<P::Error, H::Error>>
     where
         P: EventProcessor<Self, H> + 'static,
         H: EventHandler<P::Context> + 'static,
@@ -129,33 +127,28 @@ pub enum EventHandlerError<P, H> {
 }
 
 /// A stream which processes events using an `EventProcessor`.
-pub struct EventHandlerStream<E, P, H>
-where
-    P: EventProcessor<E, H>,
-    H: EventHandler<P::Context>,
-{
+pub struct EventHandlerStream<E> {
     next_fut: ReusableBoxFuture<
         'static,
         (
-            P,
             Streaming<EventBatch>,
             IntoIter<eventus::server::eventstore::Event>,
-            Option<Result<(), EventHandlerError<P::Error, H::Error>>>,
+            Option<Result<UnprocessedEvent<E>, Status>>,
         ),
     >,
-    phantom: PhantomData<(E, H)>,
+    phantom: PhantomData<fn() -> E>,
 }
 
-impl<E, P, H> EventHandlerStream<E, P, H>
-where
-    E: 'static,
-    P: EventProcessor<E, H> + 'static,
-    H: EventHandler<P::Context> + 'static,
-{
-    async fn new(
+impl<E> EventHandlerStream<E> {
+    async fn new<P, H>(
         client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-        processor: P,
-    ) -> Result<Self, EventHandlerError<P::Error, H::Error>> {
+        processor: &mut P,
+    ) -> Result<Self, EventHandlerError<P::Error, H::Error>>
+    where
+        E: 'static,
+        P: EventProcessor<E, H>,
+        H: EventHandler<P::Context>,
+    {
         let stream = client
             .subscribe(SubscribeRequest {
                 start_from: Some(StartFrom::EventId(
@@ -170,7 +163,6 @@ where
 
         Ok(EventHandlerStream {
             next_fut: ReusableBoxFuture::new(event_handler_stream_next(
-                processor,
                 stream,
                 IntoIter::default(),
             )),
@@ -178,32 +170,38 @@ where
         })
     }
 
-    pub async fn run(self) -> Result<(), EventHandlerError<P::Error, H::Error>>
+    // pub async fn next_event(&mut self) -> Result<UnprocessedEvent<'a, E, P, H>, Status> {}
+
+    pub async fn run<P, H>(
+        &mut self,
+        processor: &mut P,
+    ) -> Result<(), EventHandlerError<P::Error, H::Error>>
     where
         E: Unpin + 'static,
         P: EventProcessor<E, H> + Unpin + 'static,
         H: EventHandler<P::Context> + Unpin + 'static,
     {
-        self.try_collect().await
+        while let Some(unprocessed_event) = self.try_next().await? {
+            unprocessed_event.process(processor).await?;
+        }
+        Ok(())
     }
 }
 
-impl<E, P, H> Stream for EventHandlerStream<E, P, H>
+impl<E> Stream for EventHandlerStream<E>
 where
-    E: Unpin + 'static,
-    P: EventProcessor<E, H> + Unpin + 'static,
-    H: EventHandler<P::Context> + Unpin + 'static,
+    E: 'static,
 {
-    type Item = Result<(), EventHandlerError<P::Error, H::Error>>;
+    type Item = Result<UnprocessedEvent<E>, Status>;
 
     fn poll_next(
         self: pin::Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let (processor, stream, event_batch, res) = ready!(this.next_fut.poll(cx));
+        let (stream, event_batch, res) = ready!(this.next_fut.poll(cx));
         this.next_fut
-            .set(event_handler_stream_next(processor, stream, event_batch));
+            .set(event_handler_stream_next(stream, event_batch));
         cx.waker().wake_by_ref();
 
         task::Poll::Ready(res)
@@ -211,62 +209,72 @@ where
 }
 
 #[async_recursion]
-async fn event_handler_stream_next<E, P, H>(
-    mut processor: P,
+async fn event_handler_stream_next<E>(
     mut stream: Streaming<EventBatch>,
     mut event_batch: IntoIter<eventus::server::eventstore::Event>,
 ) -> (
-    P,
     Streaming<EventBatch>,
     IntoIter<eventus::server::eventstore::Event>,
-    Option<Result<(), EventHandlerError<P::Error, H::Error>>>,
-)
-where
-    P: EventProcessor<E, H>,
-    H: EventHandler<P::Context>,
-{
+    Option<Result<UnprocessedEvent<E>, Status>>,
+) {
     match event_batch.next() {
-        Some(event) => {
-            let res = process_next_event(&mut processor, event).await;
-            (processor, stream, event_batch, Some(res))
-        }
+        Some(event) => match Event::try_from(event) {
+            Ok(event) => (stream, event_batch, Some(Ok(UnprocessedEvent::new(event)))),
+            Err(_) => (
+                stream,
+                event_batch,
+                Some(Err(Status::new(Code::Internal, "invalid timestamp"))),
+            ),
+        },
         None => match stream.next().await {
             Some(Ok(EventBatch { events })) => {
                 let mut event_batch = events.into_iter();
                 match event_batch.next() {
-                    Some(event) => {
-                        let res = process_next_event(&mut processor, event).await;
-                        (processor, stream, event_batch, Some(res))
-                    }
-                    None => event_handler_stream_next(processor, stream, event_batch).await,
+                    Some(event) => match Event::try_from(event) {
+                        Ok(event) => (stream, event_batch, Some(Ok(UnprocessedEvent::new(event)))),
+                        Err(_) => (
+                            stream,
+                            event_batch,
+                            Some(Err(Status::new(Code::Internal, "invalid timestamp"))),
+                        ),
+                    },
+                    None => event_handler_stream_next(stream, event_batch).await,
                 }
             }
-            Some(Err(status)) => (
-                processor,
-                stream,
-                event_batch,
-                Some(Err(EventHandlerError::Grpc(status))),
-            ),
-            None => (processor, stream, event_batch, None),
+            Some(Err(status)) => (stream, event_batch, Some(Err(status))),
+            None => (stream, event_batch, None),
         },
     }
 }
 
-async fn process_next_event<E, P, H>(
-    processor: &mut P,
-    event: eventus::server::eventstore::Event,
-) -> Result<(), EventHandlerError<P::Error, H::Error>>
-where
-    P: EventProcessor<E, H>,
-    H: EventHandler<P::Context>,
-{
-    let event =
-        Event::try_from(event).map_err(|_| Status::new(Code::Internal, "invalid timestamp"))?;
-    info!(
-        "{} {:<32} {:>6} > {}",
-        event.id, event.stream_id, event.stream_version, event.name
-    );
-    processor.process_event(event).await
+#[must_use = "the event has not been processed yet"]
+pub struct UnprocessedEvent<E> {
+    pub event: Event,
+    phantom: PhantomData<fn() -> E>,
+}
+
+impl<E> UnprocessedEvent<E> {
+    fn new(event: Event) -> Self {
+        UnprocessedEvent {
+            event,
+            phantom: PhantomData,
+        }
+    }
+
+    pub async fn process<P, H>(
+        self,
+        processor: &mut P,
+    ) -> Result<(), EventHandlerError<P::Error, H::Error>>
+    where
+        P: EventProcessor<E, H>,
+        H: EventHandler<P::Context>,
+    {
+        info!(
+            "{} {:<32} {:>6} > {}",
+            self.event.id, self.event.stream_id, self.event.stream_version, self.event.name
+        );
+        processor.process_event(self.event).await
+    }
 }
 
 macro_rules! impl_composite_event_handler {
