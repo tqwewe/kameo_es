@@ -3,8 +3,9 @@ pub mod in_memory;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
-use std::{marker::PhantomData, pin, task};
+use std::{marker::PhantomData, pin, task, vec::IntoIter};
 
+use async_recursion::async_recursion;
 use eventus::server::{
     eventstore::{
         event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
@@ -138,6 +139,7 @@ where
         (
             P,
             Streaming<EventBatch>,
+            IntoIter<eventus::server::eventstore::Event>,
             Option<Result<(), EventHandlerError<P::Error, H::Error>>>,
         ),
     >,
@@ -167,7 +169,11 @@ where
             .into_inner();
 
         Ok(EventHandlerStream {
-            next_fut: ReusableBoxFuture::new(event_handler_stream_next(processor, stream)),
+            next_fut: ReusableBoxFuture::new(event_handler_stream_next(
+                processor,
+                stream,
+                IntoIter::default(),
+            )),
             phantom: PhantomData,
         })
     }
@@ -195,58 +201,72 @@ where
         cx: &mut task::Context<'_>,
     ) -> task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let (processor, stream, res) = ready!(this.next_fut.poll(cx));
+        let (processor, stream, event_batch, res) = ready!(this.next_fut.poll(cx));
         this.next_fut
-            .set(event_handler_stream_next(processor, stream));
+            .set(event_handler_stream_next(processor, stream, event_batch));
         cx.waker().wake_by_ref();
 
         task::Poll::Ready(res)
     }
 }
 
+#[async_recursion]
 async fn event_handler_stream_next<E, P, H>(
     mut processor: P,
     mut stream: Streaming<EventBatch>,
+    mut event_batch: IntoIter<eventus::server::eventstore::Event>,
 ) -> (
     P,
     Streaming<EventBatch>,
+    IntoIter<eventus::server::eventstore::Event>,
     Option<Result<(), EventHandlerError<P::Error, H::Error>>>,
 )
 where
     P: EventProcessor<E, H>,
     H: EventHandler<P::Context>,
 {
-    match stream.next().await {
-        Some(Ok(EventBatch { events })) => {
-            for event in events {
-                let Ok(event) = Event::try_from(event) else {
-                    return (
-                        processor,
-                        stream,
-                        Some(Err(EventHandlerError::Grpc(Status::new(
-                            Code::Internal,
-                            "invalid timestamp received",
-                        )))),
-                    );
-                };
-                info!(
-                    "{} {:<32} {:>6} > {}",
-                    event.id, event.stream_id, event.stream_version, event.name
-                );
-                if let Err(err) = processor.process_event(event).await {
-                    return (processor, stream, Some(Err(err)));
+    match event_batch.next() {
+        Some(event) => {
+            let res = process_next_event(&mut processor, event).await;
+            (processor, stream, event_batch, Some(res))
+        }
+        None => match stream.next().await {
+            Some(Ok(EventBatch { events })) => {
+                let mut event_batch = events.into_iter();
+                match event_batch.next() {
+                    Some(event) => {
+                        let res = process_next_event(&mut processor, event).await;
+                        (processor, stream, event_batch, Some(res))
+                    }
+                    None => event_handler_stream_next(processor, stream, event_batch).await,
                 }
             }
-
-            (processor, stream, Some(Ok(())))
-        }
-        Some(Err(status)) => (
-            processor,
-            stream,
-            Some(Err(EventHandlerError::Grpc(status))),
-        ),
-        None => (processor, stream, None),
+            Some(Err(status)) => (
+                processor,
+                stream,
+                event_batch,
+                Some(Err(EventHandlerError::Grpc(status))),
+            ),
+            None => (processor, stream, event_batch, None),
+        },
     }
+}
+
+async fn process_next_event<E, P, H>(
+    processor: &mut P,
+    event: eventus::server::eventstore::Event,
+) -> Result<(), EventHandlerError<P::Error, H::Error>>
+where
+    P: EventProcessor<E, H>,
+    H: EventHandler<P::Context>,
+{
+    let event =
+        Event::try_from(event).map_err(|_| Status::new(Code::Internal, "invalid timestamp"))?;
+    info!(
+        "{} {:<32} {:>6} > {}",
+        event.id, event.stream_id, event.stream_version, event.name
+    );
+    processor.process_event(event).await
 }
 
 macro_rules! impl_composite_event_handler {
