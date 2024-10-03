@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.82"
+async-recursion = "1.1.1"
 # cbor4ii = { version = "0.3.3", features = ["serde1"] }
 chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2.2"
