@@ -17,6 +17,15 @@ pub struct Session {
     dirty: bool,
 }
 
+impl Session {
+    pub fn new(session: ClientSession) -> Self {
+        Session {
+            session,
+            dirty: false,
+        }
+    }
+}
+
 impl ops::Deref for Session {
     type Target = ClientSession;
 
@@ -70,6 +79,11 @@ impl<H> MongoDBEventProcessor<H> {
         self.flush_interval = num_ignored_events;
         self
     }
+
+    /// Gets a reference to the inner handler.
+    pub fn handler(&mut self) -> &mut H {
+        &mut self.handler
+    }
 }
 
 impl<E, H> EventProcessor<E, H> for MongoDBEventProcessor<H>
@@ -91,10 +105,7 @@ where
 
         let mut session = self.client.start_session().await?;
         session.start_transaction().await?;
-        let mut session = Session {
-            session,
-            dirty: false,
-        };
+        let mut session = Session::new(session);
 
         self.handler.composite_handle(&mut session, event).await?;
 

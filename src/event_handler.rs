@@ -170,16 +170,30 @@ impl<E> EventHandlerStream<E> {
         })
     }
 
-    // pub async fn next_event(&mut self) -> Result<UnprocessedEvent<'a, E, P, H>, Status> {}
+    pub async fn process_next<P, H>(
+        &mut self,
+        processor: &mut P,
+    ) -> Option<Result<(), EventHandlerError<P::Error, H::Error>>>
+    where
+        E: 'static,
+        P: EventProcessor<E, H>,
+        H: EventHandler<P::Context>,
+    {
+        let event = self.next().await?;
+        match event {
+            Ok(event) => Some(event.process(processor).await),
+            Err(err) => Some(Err(EventHandlerError::Grpc(err))),
+        }
+    }
 
     pub async fn run<P, H>(
         &mut self,
         processor: &mut P,
     ) -> Result<(), EventHandlerError<P::Error, H::Error>>
     where
-        E: Unpin + 'static,
-        P: EventProcessor<E, H> + Unpin + 'static,
-        H: EventHandler<P::Context> + Unpin + 'static,
+        E: 'static,
+        P: EventProcessor<E, H>,
+        H: EventHandler<P::Context>,
     {
         while let Some(unprocessed_event) = self.try_next().await? {
             unprocessed_event.process(processor).await?;
