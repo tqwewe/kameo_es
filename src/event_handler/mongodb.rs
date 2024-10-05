@@ -24,6 +24,10 @@ impl Session {
             dirty: false,
         }
     }
+
+    pub async fn commit(mut self) -> Result<(), mongodb::error::Error> {
+        self.session.commit_transaction().await
+    }
 }
 
 impl ops::Deref for Session {
@@ -84,6 +88,10 @@ impl<H> MongoDBEventProcessor<H> {
     pub fn handler(&mut self) -> &mut H {
         &mut self.handler
     }
+
+    pub fn last_handled_event(&self) -> Option<u64> {
+        self.last_handled_event
+    }
 }
 
 impl<E, H> EventProcessor<E, H> for MongoDBEventProcessor<H>
@@ -107,7 +115,12 @@ where
         session.start_transaction().await?;
         let mut session = Session::new(session);
 
-        self.handler.composite_handle(&mut session, event).await?;
+        let res = self.handler.composite_handle(&mut session, event).await;
+        if res.is_err() {
+            let abort_res = session.abort_transaction().await;
+            res?;
+            abort_res?;
+        }
 
         let Session { mut session, dirty } = session;
 
