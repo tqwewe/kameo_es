@@ -13,6 +13,10 @@ impl<H> InMemoryEventProcessor<H> {
     pub fn new(handler: H) -> Self {
         InMemoryEventProcessor { handler }
     }
+
+    pub fn into_handler(self) -> H {
+        self.handler
+    }
 }
 
 impl<E, H> EventProcessor<E, H> for InMemoryEventProcessor<H>

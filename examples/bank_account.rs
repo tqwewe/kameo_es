@@ -2,7 +2,7 @@ use anyhow::bail;
 use eventus::server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor};
 use kameo_es::{
     command_service::{CommandService, Execute, ExecuteExt},
-    Apply, Command, Context, Entity, EventType,
+    Apply, Command, Context, Entity, EventType, Metadata,
 };
 
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ pub enum BankAccountEvent {
 }
 
 impl Apply for BankAccount {
-    fn apply(&mut self, event: Self::Event) {
+    fn apply(&mut self, event: Self::Event, _metadata: Metadata<()>) {
         match event {
             BankAccountEvent::MoneyWithdrawn { amount } => self.balance -= amount as i64,
             BankAccountEvent::MoneyDeposited { amount } => self.balance += amount as i64,

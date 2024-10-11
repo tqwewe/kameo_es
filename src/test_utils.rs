@@ -37,7 +37,7 @@ where
         E: Entity + Command<C> + Apply,
     {
         for event in self.events {
-            self.entity.apply(event);
+            self.entity.apply(event, Metadata::default());
         }
 
         When {

@@ -13,7 +13,7 @@ use eventus::{
 };
 use futures::{stream::BoxStream, TryStreamExt};
 use kameo::{
-    actor::{ActorPool, ActorRef},
+    actor::{pool::ActorPool, ActorRef},
     message::{Context, Message},
     Actor,
 };

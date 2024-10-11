@@ -2,6 +2,10 @@ pub mod file;
 pub mod in_memory;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
+#[cfg(feature = "mongodb")]
+pub mod mongodb_bulk;
+#[cfg(feature = "polodb")]
+pub mod polodb;
 
 use std::{marker::PhantomData, pin, task, vec::IntoIter};
 

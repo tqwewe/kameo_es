@@ -15,8 +15,8 @@ use kameo::{
     request::{ForwardMessageSend, MessageSend},
     Actor,
 };
-use tokio::sync::Notify;
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
+use uuid::Uuid;
 
 use crate::{
     entity_actor::{self, EntityActor},
@@ -155,6 +155,11 @@ where
         self
     }
 
+    pub fn correlation_id(mut self, id: Uuid) -> Self {
+        self.metadata.correlation_id = id;
+        self
+    }
+
     pub fn metadata(mut self, metadata: M) -> Self {
         self.metadata = self.metadata.with_data(metadata);
         self
@@ -201,7 +206,6 @@ where
                     E::default(),
                     stream_name.clone(),
                     self.event_store.clone(),
-                    Arc::new(Notify::new()),
                 ));
 
                 entity_ref.link_child(&ctx.actor_ref()).await;
@@ -267,19 +271,17 @@ where
         match self.entities.get(&stream_name) {
             Some(_) => {}
             None => {
-                let notify = Arc::new(Notify::new());
                 let entity_ref = kameo::spawn(EntityActor::new(
                     E::default(),
                     stream_name.clone(),
                     self.event_store.clone(),
-                    notify.clone(),
                 ));
 
                 entity_ref.link_child(&ctx.actor_ref()).await;
 
                 self.entities
                     .insert(stream_name, (entity_ref.id(), Box::new(entity_ref.clone())));
-                notify.notified().await;
+                entity_ref.wait_startup().await;
             }
         };
     }

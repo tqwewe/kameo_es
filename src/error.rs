@@ -3,11 +3,18 @@ use std::{borrow::Cow, io, sync::Arc};
 use eventus::{CurrentVersion, ExpectedVersion};
 use thiserror::Error;
 use tonic::Status;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ExecuteError<E> {
     #[error("{0:?}")]
     Handle(E),
+    #[error(
+        "entity has existing correlation id {existing} which does not match the one set {new}"
+    )]
+    CorrelationIDMismatch { existing: Uuid, new: Uuid },
+    #[error("entity has no correlation id but contains events")]
+    CorrelationIDNotSetOnExistingEntity,
     #[error(transparent)]
     Database(#[from] Status),
     #[error("entity '{category}-{id}' actor not running")]

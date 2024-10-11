@@ -20,11 +20,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use stream_id::StreamID;
 use thiserror::Error;
 use tonic::{transport::Channel, Code, Status};
+use uuid::Uuid;
 
 pub trait Entity: Default + Send + 'static {
     type ID: FromStr + fmt::Display + Send;
     type Event: EventType + Clone + Serialize + DeserializeOwned + Send + Sync;
-    type Metadata: Serialize + DeserializeOwned + Default + Unpin + Send + Sync + 'static;
+    type Metadata: Serialize + DeserializeOwned + Clone + Default + Unpin + Send + Sync + 'static;
 
     fn name() -> &'static str;
 }
@@ -34,9 +35,14 @@ pub trait Command<C>: Entity {
 
     fn handle(&self, cmd: C, ctx: Context<'_, Self>) -> Result<Vec<Self::Event>, Self::Error>;
 
-    /// Returns true if the command should be ignored due to it being previously handled.
+    /// Checks if the command can be processed idempotently.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the operation can be processed idempotently, meaning no side effects or duplicates will occur.
+    /// * `false` if processing the operation would cause an idempotency violation, and it should be avoided.
     fn is_idempotent(&self, _cmd: &C, ctx: Context<'_, Self>) -> bool {
-        ctx.processed()
+        !ctx.processed()
     }
 }
 
@@ -44,7 +50,7 @@ pub trait Apply
 where
     Self: Entity,
 {
-    fn apply(&mut self, event: Self::Event);
+    fn apply(&mut self, event: Self::Event, metadata: Metadata<Self::Metadata>);
 }
 
 pub trait EventType {
@@ -164,49 +170,28 @@ impl Event {
     #[inline]
     pub fn as_entity<E>(
         self,
-    ) -> Result<Event<E::Event, E::Metadata>, (Event<(), ()>, ciborium::value::Error)>
+    ) -> Result<Event<E::Event, E::Metadata>, (Event, ciborium::value::Error)>
     where
         E: Entity,
     {
         let data = match self.data.0.deserialized() {
             Ok(data) => data,
             Err(err) => {
-                return Err((
-                    Event {
-                        id: self.id,
-                        stream_id: self.stream_id,
-                        stream_version: self.stream_version,
-                        name: self.name,
-                        data: (),
-                        metadata: Metadata {
-                            causation_event_id: self.metadata.causation_event_id,
-                            causation_stream_id: self.metadata.causation_stream_id,
-                            causation_stream_version: self.metadata.causation_stream_version,
-                            data: (),
-                        },
-                        timestamp: self.timestamp,
-                    },
-                    err,
-                ));
+                return Err((self, err));
             }
         };
 
         let metadata = match self.metadata.cast() {
             Ok(metadata) => metadata,
-            Err(err) => {
+            Err(CastMetadataError { err, metadata }) => {
                 return Err((
                     Event {
                         id: self.id,
                         stream_id: self.stream_id,
                         stream_version: self.stream_version,
                         name: self.name,
-                        data: (),
-                        metadata: Metadata {
-                            causation_event_id: None,
-                            causation_stream_id: None,
-                            causation_stream_version: None,
-                            data: (),
-                        },
+                        data: self.data,
+                        metadata,
                         timestamp: self.timestamp,
                     },
                     err,
@@ -282,6 +267,8 @@ pub struct Metadata<T> {
     pub causation_stream_id: Option<StreamID>,
     #[serde(rename = "csv", skip_serializing_if = "Option::is_none")]
     pub causation_stream_version: Option<u64>,
+    #[serde(rename = "cid")]
+    pub correlation_id: Uuid,
     pub data: T,
 }
 
@@ -291,25 +278,36 @@ impl<T> Metadata<T> {
             causation_event_id: self.causation_event_id,
             causation_stream_id: self.causation_stream_id,
             causation_stream_version: self.causation_stream_version,
+            correlation_id: self.correlation_id,
             data,
         }
     }
 }
 
 impl Metadata<GenericValue> {
-    pub fn cast<U>(self) -> Result<Metadata<U>, ciborium::value::Error>
+    pub fn cast<U>(self) -> Result<Metadata<U>, CastMetadataError>
     where
         U: DeserializeOwned + Default,
     {
+        let data = if matches!(self.data, GenericValue(Value::Null)) {
+            U::default()
+        } else {
+            match self.data.0.deserialized() {
+                Ok(data) => data,
+                Err(err) => {
+                    return Err(CastMetadataError {
+                        err,
+                        metadata: self,
+                    })
+                }
+            }
+        };
         Ok(Metadata {
             causation_event_id: self.causation_event_id,
             causation_stream_id: self.causation_stream_id,
             causation_stream_version: self.causation_stream_version,
-            data: if matches!(self.data, GenericValue(Value::Null)) {
-                U::default()
-            } else {
-                self.data.0.deserialized()?
-            },
+            correlation_id: self.correlation_id,
+            data,
         })
     }
 }
@@ -327,6 +325,20 @@ impl<T> ops::DerefMut for Metadata<T> {
         &mut self.data
     }
 }
+
+#[derive(Debug)]
+pub struct CastMetadataError {
+    pub err: ciborium::value::Error,
+    pub metadata: Metadata<GenericValue>,
+}
+
+impl fmt::Display for CastMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to cast metadata: {}", self.err)
+    }
+}
+
+impl std::error::Error for CastMetadataError {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
