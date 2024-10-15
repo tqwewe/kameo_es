@@ -11,6 +11,10 @@ use crate::stream_id::StreamID;
 pub enum ExecuteError<E> {
     #[error("{0:?}")]
     Handle(E),
+    #[error("command service not running")]
+    CommandServiceNotRunning,
+    #[error("command service stopped")]
+    CommandServiceStopped,
     #[error(
         "entity has existing correlation id {existing} which does not match the one set {new}"
     )]

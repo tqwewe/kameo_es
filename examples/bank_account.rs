@@ -15,13 +15,21 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let client =
         EventStoreClient::with_interceptor(channel, ClientAuthInterceptor::new("localhost")?);
-    let cmd_service = kameo::spawn(CommandService::new(client));
+    let cmd_service = CommandService::new(client);
 
-    BankAccount::execute(
-        &cmd_service,
-        Execute::new("abc".to_string(), Deposit { amount: 10_000 }),
-    )
-    .await?;
+    BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 10_000 }).await?;
+
+    let tx = cmd_service.transaction();
+
+    BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 1_000 })
+        .transaction(&tx)
+        .await?;
+
+    BankAccount::execute(&cmd_service, "def".to_string(), Deposit { amount: 2_500 })
+        .transaction(&tx)
+        .await?;
+
+    tx.commit().await?;
 
     Ok(())
 }

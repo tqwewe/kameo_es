@@ -1,11 +1,14 @@
-use std::{any, collections::HashMap, fmt, marker::PhantomData, sync::Arc, time::Instant};
+use std::{
+    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, sync::Arc,
+    time::Instant,
+};
 
 use chrono::{DateTime, Utc};
 use eventus::{
     server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor},
     ExpectedVersion,
 };
-use futures::Future;
+use futures::{future::BoxFuture, FutureExt};
 use kameo::{
     actor::{ActorID, ActorRef, WeakActorRef},
     error::{ActorStopReason, BoxError, PanicError, SendError},
@@ -115,15 +118,7 @@ pub trait ExecuteExt<E, C>
 where
     E: Entity + Command<C>,
 {
-    fn execute(
-        cmd_service: &CommandService,
-        command: Execute<E, C, E::Metadata>,
-    ) -> impl Future<
-        Output = Result<
-            ExecuteResult<E::Event>,
-            SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
-        >,
-    >;
+    fn execute<'a>(cmd_service: &'a CommandService, id: E::ID, command: C) -> Execute<'a, E, C>;
 }
 
 impl<E, C> ExecuteExt<E, C> for E
@@ -133,25 +128,20 @@ where
     E::Error: fmt::Debug + Send + Sync,
     C: Clone + Send + 'static,
 {
-    async fn execute(
-        cmd_service: &CommandService,
-        command: Execute<E, C, E::Metadata>,
-    ) -> Result<
-        ExecuteResult<E::Event>,
-        SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
-    > {
-        cmd_service.actor_ref.ask(command).send().await
+    fn execute<'a>(cmd_service: &'a CommandService, id: E::ID, command: C) -> Execute<'a, E, C> {
+        Execute::new(cmd_service, id, command)
     }
 }
 
 #[derive(Debug)]
-pub struct Execute<E, C, M>
+pub struct Execute<'a, E, C>
 where
     E: Entity,
 {
+    cmd_service: &'a CommandService,
     id: E::ID,
     command: C,
-    metadata: Metadata<M>,
+    metadata: Metadata<E::Metadata>,
     expected_version: ExpectedVersion,
     time: DateTime<Utc>,
     executed_at: Instant,
@@ -166,15 +156,13 @@ pub enum ExecuteResult<E> {
     Idempotent,
 }
 
-impl<E, C, M> Execute<E, C, M>
+impl<'a, E, C> Execute<'a, E, C>
 where
     E: Entity,
 {
-    pub fn new(id: E::ID, command: C) -> Self
-    where
-        M: Default,
-    {
+    fn new(cmd_service: &'a CommandService, id: E::ID, command: C) -> Self {
         Execute {
+            cmd_service,
             id,
             command,
             metadata: Metadata::default(),
@@ -205,7 +193,7 @@ where
         self
     }
 
-    pub fn metadata(mut self, metadata: M) -> Self {
+    pub fn metadata(mut self, metadata: E::Metadata) -> Self {
         self.metadata = self.metadata.with_data(metadata);
         self
     }
@@ -226,6 +214,46 @@ where
     }
 }
 
+impl<'a, E, C> IntoFuture for Execute<'a, E, C>
+where
+    E: Entity + Command<C> + Apply,
+    C: Clone + Send + 'static,
+{
+    type Output = Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>;
+    type IntoFuture = BoxFuture<'a, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        async move {
+            self.cmd_service
+                .actor_ref
+                .ask(ExecuteMsg {
+                    id: self.id,
+                    command: self.command,
+                    metadata: self.metadata,
+                    expected_version: self.expected_version,
+                    time: self.time,
+                    executed_at: self.executed_at,
+                    tx_sender: self.tx_sender,
+                    phantom: PhantomData::<E>,
+                })
+                .send()
+                .await
+                .map_err(|err| match err {
+                    SendError::ActorNotRunning(_) => ExecuteError::CommandServiceNotRunning,
+                    SendError::ActorStopped => ExecuteError::CommandServiceStopped,
+                    SendError::MailboxFull(_) => {
+                        unreachable!("messages aren't sent to the command service with try_")
+                    }
+                    SendError::HandlerError(err) => err,
+                    SendError::Timeout(_) => {
+                        unreachable!("messages aren't sent to the command service with timeouts")
+                    }
+                })
+        }
+        .boxed()
+    }
+}
+
 pub struct AppendedEvent<E> {
     pub event: E,
     pub event_id: u64, // TODO: Make this only available when not using a transaction
@@ -233,7 +261,22 @@ pub struct AppendedEvent<E> {
     pub timestamp: DateTime<Utc>,
 }
 
-impl<E, C> Message<Execute<E, C, E::Metadata>> for CommandServiceActor
+#[derive(Debug)]
+struct ExecuteMsg<E, C>
+where
+    E: Entity,
+{
+    id: E::ID,
+    command: C,
+    metadata: Metadata<E::Metadata>,
+    expected_version: ExpectedVersion,
+    time: DateTime<Utc>,
+    executed_at: Instant,
+    tx_sender: Option<TransactionSender>,
+    phantom: PhantomData<E>,
+}
+
+impl<E, C> Message<ExecuteMsg<E, C>> for CommandServiceActor
 where
     E: Command<C> + Apply,
     C: Clone + Send + 'static,
@@ -242,7 +285,7 @@ where
 
     async fn handle(
         &mut self,
-        msg: Execute<E, C, E::Metadata>,
+        msg: ExecuteMsg<E, C>,
         mut ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let stream_name = StreamID::new_from_parts(E::name(), &msg.id);
