@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use eventus::{
     server::{
         eventstore::{
-            event_store_client::EventStoreClient, AppendToStreamRequest, GetStreamEventsRequest,
-            NewEvent,
+            event_store_client::EventStoreClient, AppendToMultipleStreamsRequest,
+            AppendToStreamRequest, GetStreamEventsRequest, NewEvent, StreamEvents,
         },
         ClientAuthInterceptor,
     },
@@ -19,9 +19,9 @@ use kameo::{
 };
 use prost_types::Timestamp;
 use serde::{de::DeserializeOwned, Serialize};
-use tonic::{service::interceptor::InterceptedService, transport::Channel, Status};
+use tonic::{service::interceptor::InterceptedService, transport::Channel, Code, Status};
 
-use crate::{stream_id::StreamID, Error, EventType};
+use crate::{stream_id::StreamID, Error, EventType, GenericValue};
 
 pub type EventStore = ActorRef<ActorPool<EventStoreWorker>>;
 
@@ -94,7 +94,7 @@ where
 
 #[derive(Debug)]
 pub struct AppendEvents<E, M> {
-    pub stream_name: StreamID,
+    pub stream_id: StreamID,
     pub events: Vec<E>,
     pub expected_version: ExpectedVersion,
     pub metadata: M,
@@ -102,15 +102,15 @@ pub struct AppendEvents<E, M> {
 }
 
 #[derive(Error)]
-pub enum AppendEventsError<M> {
+pub enum AppendEventsError<E, M> {
     #[error(transparent)]
-    Database(#[from] Status),
-    #[error("expected '{category}-{id}' version {expected} but got {current}")]
+    Database(Status),
+    #[error("expected '{stream_id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
-        category: String,
-        id: String,
+        stream_id: StreamID,
         current: CurrentVersion,
         expected: ExpectedVersion,
+        events: E,
         metadata: M,
     },
     #[error("invalid timestamp")]
@@ -119,35 +119,33 @@ pub enum AppendEventsError<M> {
     SerializeEvent(#[from] ciborium::ser::Error<io::Error>),
 }
 
-impl<M> fmt::Debug for AppendEventsError<M> {
+impl<E, M> fmt::Debug for AppendEventsError<E, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Database(arg0) => f.debug_tuple("Database").field(arg0).finish(),
+            Self::Database(db) => f.debug_tuple("Database").field(db).finish(),
             Self::IncorrectExpectedVersion {
-                category,
-                id,
+                stream_id,
                 current,
                 expected,
                 ..
             } => f
                 .debug_struct("IncorrectExpectedVersion")
-                .field("category", category)
-                .field("id", id)
+                .field("stream_id", stream_id)
                 .field("current", current)
                 .field("expected", expected)
                 .finish(),
             Self::InvalidTimestamp => f.debug_struct("InvalidTimestamp").finish(),
-            Self::SerializeEvent(arg0) => f.debug_tuple("SerializeEvent").field(arg0).finish(),
+            Self::SerializeEvent(ev) => f.debug_tuple("SerializeEvent").field(ev).finish(),
         }
     }
 }
 
 impl<E, M> Message<AppendEvents<E, M>> for EventStoreWorker
 where
-    E: EventType + Serialize + Send + 'static,
+    E: EventType + Serialize + Send + Sync + 'static,
     M: Serialize + Send + Sync + 'static,
 {
-    type Reply = Result<(u64, DateTime<Utc>), AppendEventsError<M>>;
+    type Reply = Result<(u64, DateTime<Utc>), AppendEventsError<Vec<E>, M>>;
 
     async fn handle(
         &mut self,
@@ -170,7 +168,7 @@ where
             })
             .collect::<Result<_, ciborium::ser::Error<io::Error>>>()?;
         let req = AppendToStreamRequest {
-            stream_id: msg.stream_name.into_inner(),
+            stream_id: msg.stream_id.clone().into_inner(),
             expected_version: Some(msg.expected_version.into()),
             events,
             timestamp: Some(Timestamp {
@@ -183,7 +181,37 @@ where
             }),
         };
 
-        let res = self.client.append_to_stream(req).await?.into_inner();
+        let res = self.client.append_to_stream(req).await;
+        let res = match res {
+            Ok(res) => res.into_inner(),
+            Err(status) => match status.code() {
+                Code::FailedPrecondition => {
+                    let current = status.metadata().get("current").unwrap();
+                    let current = match current.to_str().unwrap() {
+                        "-1" => CurrentVersion::NoStream,
+                        s => CurrentVersion::Current(s.parse::<u64>().unwrap()),
+                    };
+
+                    let expected = status.metadata().get("expected").unwrap();
+                    let expected = match expected.to_str().unwrap() {
+                        "any" => ExpectedVersion::Any,
+                        "stream_exists" => ExpectedVersion::StreamExists,
+                        "no_stream" => ExpectedVersion::NoStream,
+                        s => ExpectedVersion::Exact(s.parse::<u64>().unwrap()),
+                    };
+
+                    return Err(AppendEventsError::IncorrectExpectedVersion {
+                        stream_id: msg.stream_id,
+                        current,
+                        expected,
+                        events: msg.events,
+                        metadata: msg.metadata,
+                    });
+                }
+                _ => return Err(AppendEventsError::Database(status)),
+            },
+        };
+
         let id = res.first_id;
         let timestamp = res.timestamp.unwrap();
 
@@ -193,5 +221,136 @@ where
                 .unwrap()
                 .to_utc(),
         ))
+    }
+}
+
+#[derive(Debug)]
+pub struct AppendTransactionEvents {
+    pub stream_events: Vec<AppendEvents<(&'static str, GenericValue), GenericValue>>,
+}
+
+impl Message<AppendTransactionEvents> for EventStoreWorker {
+    type Reply = Result<
+        Vec<(u64, DateTime<Utc>)>,
+        AppendEventsError<
+            Vec<AppendEvents<(&'static str, GenericValue), GenericValue>>,
+            GenericValue,
+        >,
+    >;
+
+    fn handle(
+        &mut self,
+        msg: AppendTransactionEvents,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> impl Future<Output = Self::Reply> + Send {
+        async move {
+            let mut streams = Vec::with_capacity(msg.stream_events.len());
+            for batch in &msg.stream_events {
+                let mut metadata = Vec::new();
+                ciborium::into_writer(&batch.metadata, &mut metadata)?;
+                let events = batch
+                    .events
+                    .iter()
+                    .map(|(event_name, event)| {
+                        let mut event_data = Vec::new();
+                        ciborium::into_writer(&event, &mut event_data)?;
+                        Ok(NewEvent {
+                            event_name: event_name.to_string(),
+                            event_data,
+                            metadata: metadata.clone(),
+                        })
+                    })
+                    .collect::<Result<_, ciborium::ser::Error<io::Error>>>()?;
+
+                streams.push(StreamEvents {
+                    stream_id: batch.stream_id.clone().into_inner(),
+                    expected_version: Some(batch.expected_version.into()),
+                    events,
+                    timestamp: Some(Timestamp {
+                        seconds: batch.timestamp.timestamp(),
+                        nanos: batch
+                            .timestamp
+                            .timestamp_subsec_nanos()
+                            .try_into()
+                            .map_err(|_| AppendEventsError::InvalidTimestamp)?,
+                    }),
+                });
+            }
+
+            let res = self
+                .client
+                .append_to_multiple_streams(AppendToMultipleStreamsRequest { streams })
+                .await;
+            let res = match res {
+                Ok(res) => res.into_inner(),
+                Err(status) => match status.code() {
+                    Code::FailedPrecondition => {
+                        let stream_id = StreamID::new(
+                            status
+                                .metadata()
+                                .get("stream_id")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+
+                        let current = status.metadata().get("current").unwrap();
+                        let current = match current.to_str().unwrap() {
+                            "-1" => CurrentVersion::NoStream,
+                            s => CurrentVersion::Current(s.parse::<u64>().unwrap()),
+                        };
+
+                        let expected = status.metadata().get("expected").unwrap();
+                        let expected = match expected.to_str().unwrap() {
+                            "any" => ExpectedVersion::Any,
+                            "stream_exists" => ExpectedVersion::StreamExists,
+                            "no_stream" => ExpectedVersion::NoStream,
+                            s => ExpectedVersion::Exact(s.parse::<u64>().unwrap()),
+                        };
+
+                        let (events, metadata) = msg.stream_events.into_iter().fold(
+                            (Vec::new(), None),
+                            |(mut events, mut metadata), append| {
+                                if append.stream_id == stream_id {
+                                    metadata = Some(append.metadata);
+                                } else {
+                                    events.push(append);
+                                }
+                                (events, metadata)
+                            },
+                        );
+
+                        return Err(AppendEventsError::IncorrectExpectedVersion {
+                            stream_id,
+                            current,
+                            expected,
+                            events,
+                            metadata: metadata.unwrap(),
+                        });
+                    }
+                    _ => return Err(AppendEventsError::Database(status)),
+                },
+            };
+
+            let results = res
+                .streams
+                .into_iter()
+                .map(|res| {
+                    let timestamp = res.timestamp.unwrap();
+                    (
+                        res.first_id,
+                        DateTime::from_timestamp(
+                            timestamp.seconds,
+                            timestamp.nanos.try_into().unwrap(),
+                        )
+                        .unwrap()
+                        .to_utc(),
+                    )
+                })
+                .collect();
+
+            Ok(results)
+        }
     }
 }

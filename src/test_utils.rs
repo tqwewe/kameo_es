@@ -66,9 +66,7 @@ where
         let metadata = Metadata::default();
         let ctx = crate::Context {
             metadata: &metadata,
-            last_causation_event_id: None,
-            last_causation_stream_id: None,
-            last_causation_stream_version: None,
+            last_causation: None,
             time: Utc::now(),
             executed_at: Instant::now(),
         };
@@ -93,9 +91,7 @@ where
         let metadata = Metadata::default();
         let ctx = crate::Context {
             metadata: &metadata,
-            last_causation_event_id: None,
-            last_causation_stream_id: None,
-            last_causation_stream_version: None,
+            last_causation: None,
             time: Utc::now(),
             executed_at: Instant::now(),
         };
@@ -118,9 +114,7 @@ where
         let metadata = Metadata::default();
         let ctx = crate::Context {
             metadata: &metadata,
-            last_causation_event_id: None,
-            last_causation_stream_id: None,
-            last_causation_stream_version: None,
+            last_causation: None,
             time: Utc::now(),
             executed_at: Instant::now(),
         };

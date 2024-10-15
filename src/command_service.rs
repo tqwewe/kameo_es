@@ -7,8 +7,8 @@ use eventus::{
 };
 use futures::Future;
 use kameo::{
-    actor::{ActorID, ActorRef},
-    error::{ActorStopReason, BoxError, SendError},
+    actor::{ActorID, ActorRef, WeakActorRef},
+    error::{ActorStopReason, BoxError, PanicError, SendError},
     mailbox::bounded::BoundedMailbox,
     message::{Context, Message},
     reply::DelegatedReply,
@@ -23,13 +23,13 @@ use crate::{
     error::ExecuteError,
     event_store::{new_event_store, EventStore},
     stream_id::StreamID,
-    Apply, Command, Entity, Event, Metadata,
+    Apply, CausationMetadata, Command, Entity, Event, Metadata, Transaction, TransactionSender,
 };
 
-/// The command service routes commands to spawned entity actors per stream id.
+#[derive(Clone, Debug)]
 pub struct CommandService {
+    actor_ref: ActorRef<CommandServiceActor>,
     event_store: EventStore,
-    entities: HashMap<StreamID, (ActorID, Box<dyn any::Any + Send + Sync + 'static>)>,
 }
 
 impl CommandService {
@@ -47,9 +47,15 @@ impl CommandService {
         client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
         workers: usize,
     ) -> Self {
-        CommandService {
-            event_store: new_event_store(client, workers),
+        let event_store = new_event_store(client, workers);
+        let actor_ref = kameo::spawn(CommandServiceActor {
+            event_store: event_store.clone(),
             entities: HashMap::new(),
+        });
+
+        CommandService {
+            actor_ref,
+            event_store,
         }
     }
 
@@ -58,10 +64,40 @@ impl CommandService {
     pub fn event_store(&self) -> &EventStore {
         &self.event_store
     }
+
+    /// Starts a transaction.
+    #[inline]
+    pub fn transaction(&self) -> Transaction {
+        Transaction::new(self.event_store.clone())
+    }
 }
 
-impl Actor for CommandService {
+/// The command service routes commands to spawned entity actors per stream id.
+struct CommandServiceActor {
+    event_store: EventStore,
+    entities: HashMap<StreamID, (ActorID, Box<dyn any::Any + Send + Sync + 'static>)>,
+}
+
+impl Actor for CommandServiceActor {
     type Mailbox = BoundedMailbox<Self>;
+
+    async fn on_stop(
+        self,
+        _actor_ref: WeakActorRef<Self>,
+        reason: ActorStopReason,
+    ) -> Result<(), BoxError> {
+        println!("command service actor stopped?? {reason:?}");
+        Ok(())
+    }
+
+    async fn on_panic(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        err: PanicError,
+    ) -> Result<Option<ActorStopReason>, BoxError> {
+        println!("command service actor errored: {err}");
+        Ok(None) // Restart
+    }
 
     async fn on_link_died(
         &mut self,
@@ -80,11 +116,11 @@ where
     E: Entity + Command<C>,
 {
     fn execute(
-        cmd_service: &ActorRef<CommandService>,
+        cmd_service: &CommandService,
         command: Execute<E, C, E::Metadata>,
     ) -> impl Future<
         Output = Result<
-            Vec<AppendedEvent<E::Event>>,
+            ExecuteResult<E::Event>,
             SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
         >,
     >;
@@ -98,13 +134,13 @@ where
     C: Clone + Send + 'static,
 {
     async fn execute(
-        cmd_service: &ActorRef<CommandService>,
+        cmd_service: &CommandService,
         command: Execute<E, C, E::Metadata>,
     ) -> Result<
-        Vec<AppendedEvent<E::Event>>,
+        ExecuteResult<E::Event>,
         SendError<Execute<E, C, E::Metadata>, ExecuteError<E::Error>>,
     > {
-        cmd_service.ask(command).send().await
+        cmd_service.actor_ref.ask(command).send().await
     }
 }
 
@@ -113,13 +149,21 @@ pub struct Execute<E, C, M>
 where
     E: Entity,
 {
-    pub id: E::ID,
-    pub command: C,
-    pub metadata: Metadata<M>,
-    pub expected_version: ExpectedVersion,
-    pub time: DateTime<Utc>,
-    pub executed_at: Instant,
-    pub phantom: PhantomData<E>,
+    id: E::ID,
+    command: C,
+    metadata: Metadata<M>,
+    expected_version: ExpectedVersion,
+    time: DateTime<Utc>,
+    executed_at: Instant,
+    tx_sender: Option<TransactionSender>,
+    phantom: PhantomData<E>,
+}
+
+pub enum ExecuteResult<E> {
+    /// The command was executed with the resulting events.
+    Executed(Vec<AppendedEvent<E>>),
+    /// The command was executed, but no new events due to idempotency
+    Idempotent,
 }
 
 impl<E, C, M> Execute<E, C, M>
@@ -137,22 +181,23 @@ where
             expected_version: ExpectedVersion::Any,
             time: Utc::now(),
             executed_at: Instant::now(),
+            tx_sender: None,
             phantom: PhantomData,
         }
     }
 
-    pub fn caused_by(mut self, event_id: u64, stream_id: StreamID, stream_version: u64) -> Self {
-        self.metadata.causation_event_id = Some(event_id);
-        self.metadata.causation_stream_id = Some(stream_id);
-        self.metadata.causation_stream_version = Some(stream_version);
+    pub fn caused_by(mut self, causation_metadata: CausationMetadata) -> Self {
+        self.metadata.causation = Some(causation_metadata);
         self
     }
 
-    pub fn caused_by_event<F, N>(mut self, event: &Event<F, N>) -> Self {
-        self.metadata.causation_event_id = Some(event.id);
-        self.metadata.causation_stream_id = Some(event.stream_id.clone());
-        self.metadata.causation_stream_version = Some(event.stream_version);
-        self
+    pub fn caused_by_event<F, N>(self, event: &Event<F, N>) -> Self {
+        self.caused_by(CausationMetadata {
+            event_id: event.id,
+            stream_id: event.stream_id.clone(),
+            stream_version: event.stream_version,
+            correlation_id: event.metadata.correlation_id,
+        })
     }
 
     pub fn correlation_id(mut self, id: Uuid) -> Self {
@@ -174,21 +219,26 @@ where
         self.time = time;
         self
     }
+
+    pub fn transaction(mut self, tx: &Transaction) -> Self {
+        self.tx_sender = Some(tx.sender());
+        self
+    }
 }
 
 pub struct AppendedEvent<E> {
     pub event: E,
-    pub event_id: u64,
+    pub event_id: u64, // TODO: Make this only available when not using a transaction
     pub stream_version: u64,
     pub timestamp: DateTime<Utc>,
 }
 
-impl<E, C> Message<Execute<E, C, E::Metadata>> for CommandService
+impl<E, C> Message<Execute<E, C, E::Metadata>> for CommandServiceActor
 where
     E: Command<C> + Apply,
     C: Clone + Send + 'static,
 {
-    type Reply = DelegatedReply<Result<Vec<AppendedEvent<E::Event>>, ExecuteError<E::Error>>>;
+    type Reply = DelegatedReply<Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>>;
 
     async fn handle(
         &mut self,
@@ -228,6 +278,7 @@ where
                         metadata: msg.metadata,
                         time: msg.time,
                         executed_at: msg.executed_at,
+                        tx_sender: msg.tx_sender,
                     })
                     .forward(tx)
                     .await;
@@ -241,6 +292,7 @@ where
                         metadata: msg.metadata,
                         time: msg.time,
                         executed_at: msg.executed_at,
+                        tx_sender: msg.tx_sender,
                     })
                     .send()
                     .await;
@@ -256,7 +308,7 @@ pub struct PrepareStream<E> {
     pub phantom: PhantomData<E>,
 }
 
-impl<E> Message<PrepareStream<E>> for CommandService
+impl<E> Message<PrepareStream<E>> for CommandServiceActor
 where
     E: Entity + Apply + Default + Send + Sync,
 {

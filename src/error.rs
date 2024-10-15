@@ -1,9 +1,11 @@
-use std::{borrow::Cow, io, sync::Arc};
+use std::{io, sync::Arc};
 
 use eventus::{CurrentVersion, ExpectedVersion};
 use thiserror::Error;
 use tonic::Status;
 use uuid::Uuid;
+
+use crate::stream_id::StreamID;
 
 #[derive(Debug, Error)]
 pub enum ExecuteError<E> {
@@ -31,19 +33,22 @@ pub enum ExecuteError<E> {
     EventStoreActorNotRunning,
     #[error("event store actor stopped")]
     EventStoreActorStopped,
-    #[error("idempotency violation")]
-    IdempotencyViolation,
+    // #[error("idempotency violation")]
+    // IdempotencyViolation,
     #[error(transparent)]
-    SerializeEvent(#[from] ciborium::ser::Error<io::Error>),
-    #[error("expected '{category}-{id}' version {expected} but got {current}")]
+    SerializeEvent(ciborium::ser::Error<io::Error>),
+    #[error("failed to serialize metadata: {0}")]
+    SerializeMetadata(ciborium::ser::Error<io::Error>),
+    #[error("expected '{stream_id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
-        category: Cow<'static, str>,
-        id: String,
+        stream_id: StreamID,
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
     #[error("invalid timestamp")]
     InvalidTimestamp,
-    #[error("too many write conflicts for stream '{category}-{id}'")]
-    TooManyConflicts { category: &'static str, id: String },
+    #[error("too many write conflicts for stream '{stream_id}'")]
+    TooManyConflicts { stream_id: StreamID },
+    #[error("transaction aborted and was not completed")]
+    TransactionAborted,
 }
