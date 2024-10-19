@@ -156,6 +156,22 @@ pub enum ExecuteResult<E> {
     Idempotent,
 }
 
+impl<E> ExecuteResult<E> {
+    pub fn len(&self) -> usize {
+        match self {
+            ExecuteResult::Executed(events) => events.len(),
+            ExecuteResult::Idempotent => 0,
+        }
+    }
+
+    pub fn into_iter(self) -> impl Iterator<Item = AppendedEvent<E>> {
+        match self {
+            ExecuteResult::Executed(events) => events.into_iter(),
+            ExecuteResult::Idempotent => vec![].into_iter(),
+        }
+    }
+}
+
 impl<'a, E, C> Execute<'a, E, C>
 where
     E: Entity,
