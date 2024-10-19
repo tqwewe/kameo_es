@@ -6,7 +6,13 @@ mod event_store;
 pub mod stream_id;
 pub mod test_utils;
 
-use std::{collections::HashMap, convert::Infallible, fmt, io, ops, str::FromStr, time::Instant};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    convert::Infallible,
+    fmt, io, ops,
+    str::FromStr,
+    time::Instant,
+};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
@@ -383,7 +389,8 @@ impl Transaction {
     pub async fn commit(mut self) -> anyhow::Result<()> {
         self.receiver.close();
 
-        let mut reply_senders = HashMap::new();
+        let mut reply_senders: HashMap<StreamID, Vec<oneshot::Sender<TransactionResult>>> =
+            HashMap::new();
         let mut stream_events = Vec::new();
         while let Some(TransactionMessage {
             stream_id,
@@ -391,7 +398,14 @@ impl Transaction {
             append,
         }) = self.receiver.recv().await
         {
-            reply_senders.insert(stream_id, reply_sender);
+            match reply_senders.entry(stream_id) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(reply_sender);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(vec![reply_sender]);
+                }
+            }
             if !append.events.is_empty() {
                 stream_events.push(append);
             }
@@ -410,8 +424,10 @@ impl Transaction {
                 .await;
             match res {
                 Ok(_) => {
-                    for (_, reply_sender) in reply_senders {
-                        let _ = reply_sender.send(TransactionResult::Ok);
+                    for (_, reply_senders) in reply_senders {
+                        for reply_sender in reply_senders {
+                            let _ = reply_sender.send(TransactionResult::Ok);
+                        }
                     }
                     return Ok(());
                 }
@@ -430,18 +446,31 @@ impl Transaction {
                     stream_events = events;
                     attempt += 1;
 
-                    let reply_sender = reply_senders.remove(&stream_id).unwrap();
-                    let (retry_sender, retry_receiver) = oneshot::channel();
-                    let _ = reply_sender.send(TransactionResult::WriteConflict {
-                        tx_sender: TransactionSender::Retry(retry_sender),
-                    });
-                    let tx_msg = retry_receiver.await?;
-                    reply_senders.insert(tx_msg.stream_id, tx_msg.reply_sender);
-                    if !tx_msg.append.events.is_empty() {
-                        stream_events.push(tx_msg.append);
+                    let mut retry_receivers = Vec::with_capacity(reply_senders.len());
+                    for reply_sender in reply_senders.remove(&stream_id).unwrap() {
+                        let (retry_sender, retry_receiver) = oneshot::channel();
+
+                        let _ = reply_sender.send(TransactionResult::WriteConflict {
+                            tx_sender: TransactionSender::Retry(retry_sender),
+                        });
+                        retry_receivers.push(retry_receiver);
                     }
-                    if stream_events.is_empty() {
-                        return Ok(());
+                    for retry_receiver in retry_receivers {
+                        let tx_msg = retry_receiver.await?;
+                        match reply_senders.entry(tx_msg.stream_id) {
+                            Entry::Occupied(mut entry) => {
+                                entry.get_mut().push(tx_msg.reply_sender);
+                            }
+                            Entry::Vacant(entry) => {
+                                entry.insert(vec![tx_msg.reply_sender]);
+                            }
+                        }
+                        if !tx_msg.append.events.is_empty() {
+                            stream_events.push(tx_msg.append);
+                        }
+                        if stream_events.is_empty() {
+                            return Ok(());
+                        }
                     }
                 }
                 Err(err) => return Err(err.into()),
@@ -494,6 +523,29 @@ impl TransactionSender {
         }
 
         Ok(reply_receiver)
+    }
+
+    pub(crate) fn same_transaction(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TransactionSender::Initial(a), TransactionSender::Initial(b)) => a.same_channel(b),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        match self {
+            TransactionSender::Initial(tx) => tx.is_closed(),
+            TransactionSender::Retry(tx) => tx.is_closed(),
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> Option<TransactionSender> {
+        match self {
+            TransactionSender::Initial(tx_sender) => {
+                Some(TransactionSender::Initial(tx_sender.clone()))
+            }
+            TransactionSender::Retry(_) => None,
+        }
     }
 }
 

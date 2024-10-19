@@ -13,8 +13,8 @@ use crate::Event;
 use super::{CompositeEventHandler, EventHandler, EventHandlerError, EventProcessor};
 
 pub struct Session {
-    session: ClientSession,
-    dirty: bool,
+    pub(crate) session: ClientSession,
+    pub(crate) dirty: bool,
 }
 
 impl Session {

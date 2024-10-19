@@ -1,11 +1,18 @@
-use anyhow::bail;
-use eventus::server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor};
+use std::{mem, sync::Arc, time::Duration};
+
+use anyhow::{bail, Context as _};
+use eventus::server::{
+    eventstore::{event_store_client::EventStoreClient, GetEventsRequest},
+    ClientAuthInterceptor,
+};
+use futures::TryStreamExt;
 use kameo_es::{
     command_service::{CommandService, Execute, ExecuteExt},
-    Apply, Command, Context, Entity, EventType, Metadata,
+    Apply, Command, Context, Entity, Event, EventType, GenericValue, Metadata,
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Barrier;
 use tonic::transport::Channel;
 
 #[tokio::main]
@@ -13,28 +20,74 @@ async fn main() -> anyhow::Result<()> {
     let channel = Channel::builder("http://[::1]:9220".parse()?)
         .connect()
         .await?;
-    let client =
+    let mut client =
         EventStoreClient::with_interceptor(channel, ClientAuthInterceptor::new("localhost")?);
+
+    let mut events = client
+        .get_events(GetEventsRequest {
+            start_event_id: 0,
+            batch_size: 1024 * 64,
+            limit: None,
+        })
+        .await?
+        .into_inner();
+    while let Some(batch) = events.try_next().await? {
+        for event in batch.events {
+            let event = Event::<GenericValue, GenericValue>::try_from(event).unwrap();
+            // dbg!(event);
+        }
+    }
+
     let cmd_service = CommandService::new(client);
 
-    BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 10_000 }).await?;
+    for _ in 0..2000 {
+        // BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 10_000 }).await?;
 
-    let tx = cmd_service.transaction();
+        let tx = cmd_service.transaction();
 
-    BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 1_000 })
-        .transaction(&tx)
-        .await?;
+        BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 1_000 })
+            .transaction(&tx)
+            .await?;
 
-    BankAccount::execute(&cmd_service, "def".to_string(), Deposit { amount: 2_500 })
-        .transaction(&tx)
-        .await?;
+        BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 2_500 })
+            .transaction(&tx)
+            .await?;
+        // let barrier = Arc::new(Barrier::new(2));
+        // tokio::spawn({
+        //     let barrier = barrier.clone();
+        //     let cmd_service = cmd_service.clone();
+        //     async move {
+        //         BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 7_000 })
+        //             .await
+        //             .unwrap();
+        //         barrier.wait().await;
+        //     }
+        // });
+        mem::drop(tx);
+        // tokio::time::sleep(Duration::from_millis(10)).await;
 
-    tx.commit().await?;
+        let tx = cmd_service.transaction();
+
+        BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 2_500 })
+            .transaction(&tx)
+            .await?;
+        // BankAccount::execute(&cmd_service, "abc".to_string(), Deposit { amount: 2_500 })
+        //     .transaction(&tx)
+        //     .await?;
+
+        // BankAccount::execute(&cmd_service, "def".to_string(), Deposit { amount: 2_500 })
+        //     .transaction(&tx)
+        //     .await?;
+
+        tx.commit().await.context("commit transaction")?;
+    }
+
+    // barrier.wait().await;
 
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BankAccount {
     balance: i64,
 }

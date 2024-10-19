@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 use chrono::{DateTime, Utc};
 use ciborium::Value;
@@ -8,9 +11,9 @@ use kameo::{
     actor::{pool::WorkerMsg, ActorRef, WeakActorRef},
     error::{ActorStopReason, BoxError, PanicError, SendError},
     mailbox::unbounded::UnboundedMailbox,
-    message::{Context, Message},
-    reply::DelegatedReply,
-    request::MessageSend,
+    message::{Context, DynMessage, Message},
+    reply::{BoxReplySender, DelegatedReply, ReplySender},
+    request::{MessageSend, MessageSendSync},
     Actor,
 };
 use tokio::sync::oneshot;
@@ -38,6 +41,12 @@ pub struct EntityActor<E> {
     // last_causation_stream_id: Option<StreamID>,
     // last_causation_stream_version: Option<u64>,
     conflict_reties: usize,
+    active_tx: Option<TransactionSender>,
+    buffered_commands: VecDeque<(Option<BoxReplySender>, Box<dyn DynMessage<Self>>)>,
+    temp_entity: Option<E>,
+    temp_version: Option<CurrentVersion>,
+    temp_correlation_id: Option<Uuid>,
+    temp_last_causations: Option<HashMap<Uuid, CausationMetadata>>,
 }
 
 impl<E> EntityActor<E> {
@@ -53,6 +62,12 @@ impl<E> EntityActor<E> {
             // last_causation_stream_id: None,
             // last_causation_stream_version: None,
             conflict_reties: 5,
+            active_tx: None,
+            buffered_commands: VecDeque::new(),
+            temp_entity: None,
+            temp_version: None,
+            temp_correlation_id: None,
+            temp_last_causations: None,
         }
     }
 
@@ -60,36 +75,16 @@ impl<E> EntityActor<E> {
     where
         E: Entity + Apply,
     {
-        assert_eq!(
-            match self.version {
-                CurrentVersion::Current(version) => version + 1,
-                CurrentVersion::NoStream => 0,
-            },
+        apply_event(
+            &self.stream_id,
+            &mut self.entity,
+            &mut self.version,
+            &mut self.correlation_id,
+            &mut self.last_causations,
+            event,
             stream_version,
-            "expected stream version {} but got {} for stream {}",
-            match self.version {
-                CurrentVersion::Current(version) => version + 1,
-                CurrentVersion::NoStream => 0,
-            },
-            stream_version,
-            self.stream_id,
-        );
-        let causation = metadata.causation.clone();
-        if self.correlation_id.is_nil() {
-            assert_eq!(
-                self.version,
-                CurrentVersion::NoStream,
-                "expected correlation id to be nil only if the stream doesn't exist"
-            );
-            self.correlation_id = metadata.correlation_id;
-        }
-        self.entity.apply(event, metadata);
-        self.version = CurrentVersion::Current(stream_version);
-
-        if let Some(causation) = causation {
-            self.last_causations
-                .insert(causation.correlation_id, causation);
-        }
+            metadata,
+        )
     }
 
     async fn resync_with_db(&mut self) -> Result<(), BoxError>
@@ -179,7 +174,26 @@ impl<E> EntityActor<E> {
         Ok(())
     }
 
-    async fn execute<C>(
+    async fn abort_transaction(&mut self, actor_ref: &ActorRef<Self>)
+    where
+        E: Entity + Apply,
+    {
+        println!("aborting transaction");
+        self.temp_version = None;
+        self.temp_entity = None;
+        self.temp_correlation_id = None;
+        self.temp_last_causations = None;
+        self.active_tx = None;
+        while let Some((reply_sender, exec)) = self.buffered_commands.pop_front() {
+            println!("handling buffered command...");
+            if let Some(err) = exec.handle_dyn(self, actor_ref.clone(), reply_sender).await {
+                std::panic::resume_unwind(Box::new(err));
+            }
+            println!("done handling buffered command.");
+        }
+    }
+
+    fn execute<C>(
         &mut self,
         id: &E::ID,
         command: C,
@@ -187,7 +201,6 @@ impl<E> EntityActor<E> {
         expected_version: ExpectedVersion,
         time: DateTime<Utc>,
         executed_at: Instant,
-        tx_sender: Option<TransactionSender>,
     ) -> Result<ActorExecutionResult<E::Event>, ExecuteError<E::Error>>
     where
         E: Entity + Command<C> + Apply,
@@ -216,14 +229,20 @@ impl<E> EntityActor<E> {
         }
 
         let events = self
-            .entity
+            .temp_entity
+            .as_ref()
+            .unwrap_or(&self.entity)
             .handle(command, ctx)
             .map_err(ExecuteError::Handle)?;
         if events.is_empty() {
             return Ok(ActorExecutionResult::Events(vec![]));
         }
 
-        match tx_sender {
+        match self
+            .active_tx
+            .as_ref()
+            .and_then(|active_tx| active_tx.try_clone())
+        {
             Some(tx_sender) => {
                 let generic_events: Vec<_> = events
                     .iter()
@@ -248,7 +267,10 @@ impl<E> EntityActor<E> {
                 let append = AppendEvents {
                     stream_id: self.stream_id.clone(),
                     events: generic_events,
-                    expected_version: self.version.as_expected_version(),
+                    expected_version: self
+                        .temp_version
+                        .unwrap_or(self.version)
+                        .as_expected_version(),
                     metadata: generic_metadata,
                     timestamp: time,
                 };
@@ -352,8 +374,8 @@ pub struct Execute<I, C, M> {
 
 impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityActor<E>
 where
-    E: Entity + Command<C> + Apply,
-    C: Clone + Send,
+    E: Entity + Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
 {
     type Reply = DelegatedReply<Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>>;
 
@@ -362,35 +384,68 @@ where
         mut exec: Execute<E::ID, C, E::Metadata>,
         mut ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let (delegated_reply, mut reply_sender) = ctx.reply_sender();
+        println!("handle...");
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+
+        match (
+            &self.active_tx,
+            exec.tx_sender
+                .as_ref()
+                .and_then(|tx_sender| tx_sender.try_clone()),
+        ) {
+            (_, Some(TransactionSender::Retry(_))) => {
+                // Its a retry, we'll handle this now
+                println!("handling retry");
+                self.active_tx = exec.tx_sender.take();
+            }
+            (Some(active_tx), Some(tx_sender)) if active_tx.same_transaction(&tx_sender) => {
+                // Apply pending transaction events
+            }
+            (Some(_), Some(_) | None) => {
+                println!("buffering event");
+                self.buffered_commands
+                    .push_back((reply_sender.map(ReplySender::boxed), Box::new(exec)));
+                return delegated_reply;
+            }
+            (None, tx_sender) => {
+                // if let Some(tx_sender) = &tx_sender {
+                //     if tx_sender.is_closed() {
+                //         if let Some(reply_sender) = reply_sender {
+                //             let _ = reply_sender.send(Ok(ExecuteResult::Executed(vec![])));
+                //         }
+                //         return delegated_reply;
+                //     }
+                // }
+                self.active_tx = tx_sender;
+            }
+        }
 
         // Derive existing correlation ID from if not set, or generate new one
         if let Err(err) = self.hydrate_metadata_correlation_id(&mut exec.metadata) {
             if let Some(reply_sender) = reply_sender {
                 let _ = reply_sender.send(Err(err));
             }
+            dbg!("return");
             return delegated_reply;
         }
 
         let mut attempt = 1;
         loop {
-            match self
-                .execute(
-                    &exec.id,
-                    exec.command.clone(),
-                    &exec.metadata,
-                    exec.expected_version,
-                    exec.time,
-                    exec.executed_at,
-                    exec.tx_sender,
-                )
-                .await
-            {
+            println!("loop");
+            match self.execute(
+                &exec.id,
+                exec.command.clone(),
+                &exec.metadata,
+                exec.expected_version,
+                exec.time,
+                exec.executed_at,
+            ) {
                 Ok(ActorExecutionResult::Events(events)) => {
                     if events.is_empty() {
                         if let Some(reply_sender) = reply_sender {
                             reply_sender.send(Ok(ExecuteResult::Executed(vec![])));
                         }
+                        dbg!("return");
                         return delegated_reply;
                     }
                     let res = self
@@ -433,6 +488,7 @@ where
                                 reply_sender.send(Ok(ExecuteResult::Executed(appended_events)));
                             }
 
+                            dbg!("return");
                             return delegated_reply;
                         }
                         Err(SendError::HandlerError(
@@ -463,6 +519,7 @@ where
                             if let Some(reply_sender) = reply_sender {
                                 reply_sender.send(Err(err.into()));
                             }
+                            dbg!("return");
                             return delegated_reply;
                         }
                     }
@@ -478,7 +535,7 @@ where
                     reply_receiver,
                 }) => {
                     // Reply to actor request
-                    let events = match reply_sender.take() {
+                    let events = match reply_sender {
                         Some(reply_sender) => {
                             let inner_events: Vec<_> = events
                                 .iter()
@@ -490,41 +547,151 @@ where
                         None => events.into_iter().map(|appended| appended.event).collect(),
                     };
 
-                    // Wait for the transaction to be comitted
-                    if let Ok(tx_res) = reply_receiver.await {
-                        match tx_res {
-                            TransactionResult::Ok => {
-                                let starting_version = match self.version {
-                                    CurrentVersion::Current(v) => v + 1,
-                                    CurrentVersion::NoStream => 0,
-                                };
-                                let mut version = starting_version;
+                    // Apply to temporary state
+                    let temp_entity = self.temp_entity.get_or_insert_with(|| self.entity.clone());
+                    let temp_version = self.temp_version.get_or_insert(self.version);
+                    let temp_correlation_id =
+                        self.temp_correlation_id.get_or_insert(self.correlation_id);
+                    let temp_last_causations = self
+                        .temp_last_causations
+                        .get_or_insert_with(|| self.last_causations.clone());
 
-                                for event in events {
-                                    self.apply(event, version, exec.metadata.clone());
-                                    version += 1;
-                                }
+                    let starting_version = match temp_version {
+                        CurrentVersion::Current(v) => *v + 1,
+                        CurrentVersion::NoStream => 0,
+                    };
+                    let mut version = starting_version;
 
-                                return delegated_reply;
-                            }
-                            TransactionResult::WriteConflict { tx_sender } => {
-                                self.resync_with_db().await.unwrap();
-                                exec.tx_sender = Some(tx_sender);
-                                continue;
-                            }
-                        }
+                    for event in events.clone() {
+                        apply_event(
+                            &self.stream_id,
+                            temp_entity,
+                            temp_version,
+                            temp_correlation_id,
+                            temp_last_causations,
+                            event,
+                            version,
+                            exec.metadata.clone(),
+                        );
+                        version += 1;
                     }
 
+                    let actor_ref = ctx.actor_ref();
+                    tokio::spawn(async move {
+                        println!("=== INSIDE TOKIO ACTOR SPAWN ===");
+                        // Wait for the transaction to be comitted
+                        // println!("waiting for transaction reply...");
+                        match reply_receiver.await {
+                            Ok(tx_res) => match tx_res {
+                                TransactionResult::Ok => {
+                                    println!("telling transaction comitted");
+                                    let _ = actor_ref.tell(TransactionComitted).send().await;
+                                }
+                                TransactionResult::WriteConflict { tx_sender } => {
+                                    exec.tx_sender = Some(tx_sender);
+                                    println!("telling transaction write conflict");
+                                    let _ = actor_ref
+                                        .tell(TransactionWriteConflict { exec })
+                                        .send()
+                                        .await;
+                                }
+                            },
+                            Err(_) => {
+                                println!("got err tx reply");
+                                let _ = actor_ref.tell(TransactionAborted).send().await;
+                            }
+                        }
+                        println!("=== OUTSIDE TOKIO ACTOR SPAWN ===");
+                    });
+
+                    dbg!("return");
                     return delegated_reply;
                 }
                 Err(err) => {
                     if let Some(reply_sender) = reply_sender {
                         reply_sender.send(Err(err));
                     }
+                    dbg!("return");
                     return delegated_reply;
                 }
             }
         }
+    }
+}
+
+struct TransactionComitted;
+
+impl<E> Message<TransactionComitted> for EntityActor<E>
+where
+    E: Entity + Apply,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: TransactionComitted,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.active_tx.is_some() {
+            self.version = self.temp_version.take().unwrap();
+            self.entity = self.temp_entity.take().unwrap();
+            self.correlation_id = self.temp_correlation_id.take().unwrap();
+            self.last_causations = self.temp_last_causations.take().unwrap();
+            self.active_tx = None;
+        }
+
+        debug!(
+            "transaction comitted, executing {} buffered commands",
+            self.buffered_commands.len()
+        );
+
+        println!("handling buffered commands");
+        while let Some((reply_sender, exec)) = self.buffered_commands.pop_front() {
+            dbg!(reply_sender.is_some());
+            if let Some(err) = exec.handle_dyn(self, ctx.actor_ref(), reply_sender).await {
+                std::panic::resume_unwind(Box::new(err));
+            }
+        }
+    }
+}
+
+struct TransactionWriteConflict<I, C, M> {
+    exec: Execute<I, C, M>,
+}
+
+impl<E, C> Message<TransactionWriteConflict<E::ID, C, E::Metadata>> for EntityActor<E>
+where
+    E: Entity + Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
+{
+    type Reply = Result<(), SendError<Execute<E::ID, C, E::Metadata>, ExecuteError<E::Error>>>;
+
+    async fn handle(
+        &mut self,
+        msg: TransactionWriteConflict<E::ID, C, E::Metadata>,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        println!("write conflict");
+        self.resync_with_db().await.unwrap();
+        ctx.actor_ref().tell(msg.exec).send_sync()
+    }
+}
+
+struct TransactionAborted;
+
+impl<E> Message<TransactionAborted> for EntityActor<E>
+where
+    E: Entity + Apply,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: TransactionAborted,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        println!("transaction aborted");
+        self.abort_transaction(&ctx.actor_ref()).await
     }
 }
 
@@ -569,5 +736,49 @@ impl<M, E> From<SendError<M, Status>> for ExecuteError<E> {
             SendError::HandlerError(err) => err.into(),
             SendError::Timeout(_) => unreachable!("no timeouts are used in the event store"),
         }
+    }
+}
+
+#[inline]
+fn apply_event<E>(
+    stream_id: &StreamID,
+    entity: &mut E,
+    current_version: &mut CurrentVersion,
+    current_correlation_id: &mut Uuid,
+    last_causations: &mut HashMap<Uuid, CausationMetadata>,
+    event: E::Event,
+    stream_version: u64,
+    metadata: Metadata<E::Metadata>,
+) where
+    E: Entity + Apply,
+{
+    assert_eq!(
+        match current_version {
+            CurrentVersion::Current(version) => *version + 1,
+            CurrentVersion::NoStream => 0,
+        },
+        stream_version,
+        "expected stream version {} but got {} for stream {}",
+        match current_version {
+            CurrentVersion::Current(version) => *version + 1,
+            CurrentVersion::NoStream => 0,
+        },
+        stream_version,
+        stream_id,
+    );
+    let causation = metadata.causation.clone();
+    if current_correlation_id.is_nil() {
+        assert_eq!(
+            *current_version,
+            CurrentVersion::NoStream,
+            "expected correlation id to be nil only if the stream doesn't exist"
+        );
+        *current_correlation_id = metadata.correlation_id;
+    }
+    entity.apply(event, metadata);
+    *current_version = CurrentVersion::Current(stream_version);
+
+    if let Some(causation) = causation {
+        last_causations.insert(causation.correlation_id, causation);
     }
 }

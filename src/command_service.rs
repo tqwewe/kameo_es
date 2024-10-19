@@ -19,6 +19,7 @@ use kameo::{
     Actor,
 };
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::{
@@ -89,7 +90,7 @@ impl Actor for CommandServiceActor {
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        println!("command service actor stopped?? {reason:?}");
+        error!("command service actor stopped: {reason:?}");
         Ok(())
     }
 
@@ -98,7 +99,7 @@ impl Actor for CommandServiceActor {
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
     ) -> Result<Option<ActorStopReason>, BoxError> {
-        println!("command service actor errored: {err}");
+        error!("command service actor errored: {err}");
         Ok(None) // Restart
     }
 
@@ -232,8 +233,8 @@ where
 
 impl<'a, E, C> IntoFuture for Execute<'a, E, C>
 where
-    E: Entity + Command<C> + Apply,
-    C: Clone + Send + 'static,
+    E: Entity + Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
 {
     type Output = Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>;
     type IntoFuture = BoxFuture<'a, Self::Output>;
@@ -294,8 +295,8 @@ where
 
 impl<E, C> Message<ExecuteMsg<E, C>> for CommandServiceActor
 where
-    E: Command<C> + Apply,
-    C: Clone + Send + 'static,
+    E: Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
 {
     type Reply = DelegatedReply<Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>>;
 
@@ -311,13 +312,11 @@ where
                 .cloned()
                 .unwrap(),
             None => {
-                let entity_ref = kameo::actor::spawn(EntityActor::new(
-                    E::default(),
-                    stream_name.clone(),
-                    self.event_store.clone(),
-                ));
-
-                entity_ref.link_child(&ctx.actor_ref()).await;
+                let entity_ref = kameo::actor::spawn_link(
+                    &ctx.actor_ref(),
+                    EntityActor::new(E::default(), stream_name.clone(), self.event_store.clone()),
+                )
+                .await;
 
                 self.entities
                     .insert(stream_name, (entity_ref.id(), Box::new(entity_ref.clone())));
@@ -382,13 +381,11 @@ where
         match self.entities.get(&stream_name) {
             Some(_) => {}
             None => {
-                let entity_ref = kameo::spawn(EntityActor::new(
-                    E::default(),
-                    stream_name.clone(),
-                    self.event_store.clone(),
-                ));
-
-                entity_ref.link_child(&ctx.actor_ref()).await;
+                let entity_ref = kameo::actor::spawn_link(
+                    &ctx.actor_ref(),
+                    EntityActor::new(E::default(), stream_name.clone(), self.event_store.clone()),
+                )
+                .await;
 
                 self.entities
                     .insert(stream_name, (entity_ref.id(), Box::new(entity_ref.clone())));
