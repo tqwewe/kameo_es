@@ -1,29 +1,26 @@
 pub mod command_service;
-mod entity_actor;
+pub mod entity_actor;
 pub mod error;
 pub mod event_handler;
 mod event_store;
 pub mod stream_id;
 pub mod test_utils;
+pub mod transaction;
 
-use std::{collections::HashMap, convert::Infallible, fmt, io, ops, str::FromStr, time::Instant};
+use std::{convert::Infallible, fmt, io, ops, str::FromStr, time::Instant};
 
-use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use ciborium::Value;
-use event_store::{AppendEvents, AppendEventsError, AppendTransactionEvents, EventStore};
 use eventus::server::eventstore::{
     event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
     SubscribeRequest,
 };
 use futures::{stream::BoxStream, StreamExt, TryStreamExt};
-use kameo::{actor::pool::WorkerMsg, error::SendError, request::MessageSend};
+use kameo::error::SendError;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use stream_id::StreamID;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
 use tonic::{transport::Channel, Code, Status};
-use tracing::debug;
 use uuid::Uuid;
 
 pub trait Entity: Default + Send + 'static {
@@ -361,146 +358,6 @@ impl ops::DerefMut for GenericValue {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
-}
-
-#[derive(Debug)]
-pub struct Transaction {
-    event_store: EventStore,
-    receiver: mpsc::UnboundedReceiver<TransactionMessage>,
-    sender: mpsc::UnboundedSender<TransactionMessage>,
-}
-
-impl Transaction {
-    pub(crate) fn new(event_store: EventStore) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        Transaction {
-            event_store,
-            receiver,
-            sender,
-        }
-    }
-
-    pub async fn commit(mut self) -> anyhow::Result<()> {
-        self.receiver.close();
-
-        let mut reply_senders = HashMap::new();
-        let mut stream_events = Vec::new();
-        while let Some(TransactionMessage {
-            stream_id,
-            reply_sender,
-            append,
-        }) = self.receiver.recv().await
-        {
-            reply_senders.insert(stream_id, reply_sender);
-            if !append.events.is_empty() {
-                stream_events.push(append);
-            }
-        }
-
-        if stream_events.is_empty() {
-            return Ok(());
-        }
-
-        let mut attempt = 1;
-        loop {
-            let res = self
-                .event_store
-                .ask(WorkerMsg(AppendTransactionEvents { stream_events }))
-                .send()
-                .await;
-            match res {
-                Ok(_) => {
-                    for (_, reply_sender) in reply_senders {
-                        let _ = reply_sender.send(TransactionResult::Ok);
-                    }
-                    return Ok(());
-                }
-                Err(SendError::HandlerError(AppendEventsError::IncorrectExpectedVersion {
-                    stream_id,
-                    current,
-                    expected,
-                    events,
-                    ..
-                })) => {
-                    debug!(%stream_id, %current, %expected, "write conflict");
-                    if attempt == 5 {
-                        return Err(anyhow!("too many conflict retries"));
-                    }
-
-                    stream_events = events;
-                    attempt += 1;
-
-                    let reply_sender = reply_senders.remove(&stream_id).unwrap();
-                    let (retry_sender, retry_receiver) = oneshot::channel();
-                    let _ = reply_sender.send(TransactionResult::WriteConflict {
-                        tx_sender: TransactionSender::Retry(retry_sender),
-                    });
-                    let tx_msg = retry_receiver.await?;
-                    reply_senders.insert(tx_msg.stream_id, tx_msg.reply_sender);
-                    if !tx_msg.append.events.is_empty() {
-                        stream_events.push(tx_msg.append);
-                    }
-                    if stream_events.is_empty() {
-                        return Ok(());
-                    }
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-
-    pub(crate) fn sender(&self) -> TransactionSender {
-        TransactionSender::Initial(self.sender.clone())
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TransactionMessage {
-    stream_id: StreamID,
-    reply_sender: oneshot::Sender<TransactionResult>,
-    append: AppendEvents<(&'static str, GenericValue), GenericValue>,
-}
-
-#[derive(Debug)]
-pub(crate) enum TransactionSender {
-    Initial(mpsc::UnboundedSender<TransactionMessage>),
-    Retry(oneshot::Sender<TransactionMessage>),
-}
-
-impl TransactionSender {
-    pub(crate) fn send_events(
-        self,
-        stream_id: StreamID,
-        append: AppendEvents<(&'static str, GenericValue), GenericValue>,
-    ) -> anyhow::Result<oneshot::Receiver<TransactionResult>> {
-        let (reply_sender, reply_receiver) = oneshot::channel();
-        match self {
-            TransactionSender::Initial(sender) => {
-                sender.send(TransactionMessage {
-                    stream_id,
-                    reply_sender,
-                    append,
-                })?;
-            }
-            TransactionSender::Retry(sender) => {
-                sender
-                    .send(TransactionMessage {
-                        stream_id,
-                        reply_sender,
-                        append,
-                    })
-                    .map_err(|_| anyhow!("failed to send to retry transaction sender"))?;
-            }
-        }
-
-        Ok(reply_receiver)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum TransactionResult {
-    Ok,
-    WriteConflict { tx_sender: TransactionSender },
 }
 
 /// Matches on an event for multiple branches, with each branch being an entity type.

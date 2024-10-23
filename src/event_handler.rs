@@ -4,8 +4,12 @@ pub mod in_memory;
 pub mod mongodb;
 #[cfg(feature = "mongodb")]
 pub mod mongodb_bulk;
+#[cfg(feature = "mongodb")]
+pub mod mongodb_correlations;
 #[cfg(feature = "polodb")]
 pub mod polodb;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 use std::{marker::PhantomData, pin, task, vec::IntoIter};
 

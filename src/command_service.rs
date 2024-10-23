@@ -1,9 +1,11 @@
 use std::{
-    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, sync::Arc,
-    time::Instant,
+    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, time::Instant,
+    vec::IntoIter,
 };
 
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
+use ciborium::Value;
 use eventus::{
     server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor},
     ExpectedVersion,
@@ -19,14 +21,16 @@ use kameo::{
     Actor,
 };
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::{
     entity_actor::{self, EntityActor},
     error::ExecuteError,
-    event_store::{new_event_store, EventStore},
+    event_store::{AppendEvents, AppendEventsError, EventStore},
     stream_id::StreamID,
-    Apply, CausationMetadata, Command, Entity, Event, Metadata, Transaction, TransactionSender,
+    transaction::Transaction,
+    Apply, CausationMetadata, Command, Entity, Event, EventType, GenericValue, Metadata,
 };
 
 #[derive(Clone, Debug)]
@@ -41,16 +45,7 @@ impl CommandService {
     pub fn new(
         client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
     ) -> Self {
-        Self::new_with_workers(client, 16)
-    }
-
-    /// Creates a new command service using an event store client connection and worker count.
-    #[inline]
-    pub fn new_with_workers(
-        client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-        workers: usize,
-    ) -> Self {
-        let event_store = new_event_store(client, workers);
+        let event_store = EventStore::new(client);
         let actor_ref = kameo::spawn(CommandServiceActor {
             event_store: event_store.clone(),
             entities: HashMap::new(),
@@ -69,9 +64,62 @@ impl CommandService {
     }
 
     /// Starts a transaction.
-    #[inline]
-    pub fn transaction(&self) -> Transaction {
-        Transaction::new(self.event_store.clone())
+    pub async fn transaction<T, F>(&mut self, mut f: F) -> anyhow::Result<T>
+    where
+        F: FnMut(Transaction<'_>) -> BoxFuture<'_, anyhow::Result<T>>,
+    {
+        let id = Transaction::get_id();
+        let mut entities = HashMap::new();
+        let mut appends = Vec::new();
+        let mut attempt = 0;
+        loop {
+            let tx = Transaction::new(id, self, &mut entities, &mut appends);
+            let res = f(tx).await;
+            match res {
+                Ok(val) => {
+                    let current_appends: Vec<_> = appends
+                        .drain(..)
+                        .filter(|append| !append.events.is_empty())
+                        .collect();
+                    if current_appends.is_empty() {
+                        Transaction::new(id, self, &mut entities, &mut appends).committed();
+                        return Ok(val);
+                    }
+
+                    // Attempt the transaction
+                    let res = self.event_store.append_to_streams(current_appends).await;
+                    match res {
+                        Ok(_) => {
+                            Transaction::new(id, self, &mut entities, &mut appends).committed();
+                            return Ok(val);
+                        }
+                        Err(AppendEventsError::IncorrectExpectedVersion {
+                            stream_id,
+                            current,
+                            expected,
+                            ..
+                        }) => {
+                            debug!(%stream_id, %current, %expected, "write conflict");
+                            if attempt >= 3 {
+                                Transaction::new(id, self, &mut entities, &mut appends).abort();
+                                return Err(anyhow!("too many conflict retries"));
+                            }
+
+                            attempt += 1;
+                            Transaction::new(id, self, &mut entities, &mut appends).reset();
+                        }
+                        Err(err) => {
+                            Transaction::new(id, self, &mut entities, &mut appends).abort();
+                            return Err(err.into());
+                        }
+                    }
+                }
+                Err(err) => {
+                    Transaction::new(id, self, &mut entities, &mut appends).abort();
+                    return Err(err.into());
+                }
+            }
+        }
     }
 }
 
@@ -84,12 +132,16 @@ struct CommandServiceActor {
 impl Actor for CommandServiceActor {
     type Mailbox = BoundedMailbox<Self>;
 
+    fn name() -> &'static str {
+        "CommandServiceActor"
+    }
+
     async fn on_stop(
-        self,
+        &mut self,
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        println!("command service actor stopped?? {reason:?}");
+        error!("command service actor stopped: {reason:?}");
         Ok(())
     }
 
@@ -98,7 +150,7 @@ impl Actor for CommandServiceActor {
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
     ) -> Result<Option<ActorStopReason>, BoxError> {
-        println!("command service actor errored: {err}");
+        error!("command service actor errored: {err}");
         Ok(None) // Restart
     }
 
@@ -114,27 +166,114 @@ impl Actor for CommandServiceActor {
     }
 }
 
-pub trait ExecuteExt<E, C>
+pub trait ExecuteExt<'a, E, C, T>
 where
     E: Entity + Command<C>,
 {
-    fn execute<'a>(cmd_service: &'a CommandService, id: E::ID, command: C) -> Execute<'a, E, C>;
+    type Transaction;
+
+    fn execute(cmd_service: T, id: E::ID, command: C) -> Execute<'a, E, C, Self::Transaction>;
 }
 
-impl<E, C> ExecuteExt<E, C> for E
+impl<'a, E, C> ExecuteExt<'a, E, C, &'a CommandService> for E
 where
     E: Entity + Command<C> + Apply + Default + Sync,
     E::Event: Clone,
     E::Error: fmt::Debug + Send + Sync,
     C: Clone + Send + 'static,
 {
-    fn execute<'a>(cmd_service: &'a CommandService, id: E::ID, command: C) -> Execute<'a, E, C> {
-        Execute::new(cmd_service, id, command)
+    type Transaction = ();
+
+    fn execute(cmd_service: &'a CommandService, id: E::ID, command: C) -> Execute<'a, E, C, ()> {
+        Execute::new(cmd_service, id, command, ())
+    }
+}
+
+impl<'a, 'b, E, C> ExecuteExt<'a, E, C, &'a mut Transaction<'b>> for E
+where
+    E: Entity + Command<C> + Apply + Default + Sync,
+    E::Event: Clone,
+    E::Error: fmt::Debug + Send + Sync,
+    C: Clone + Send + 'static,
+    'b: 'a,
+{
+    type Transaction = &'a mut Transaction<'b>;
+
+    fn execute(
+        tx: &'a mut Transaction<'b>,
+        id: E::ID,
+        command: C,
+    ) -> Execute<'a, E, C, &'a mut Transaction<'b>> {
+        Execute::new(&tx.cmd_service, id, command, tx)
     }
 }
 
 #[derive(Debug)]
-pub struct Execute<'a, E, C>
+pub enum ExecuteResult<E: Entity + Apply + Clone> {
+    /// The command was executed with the resulting events.
+    Executed(Vec<AppendedEvent<E::Event>>),
+    /// The command was executed and pending commit.
+    PendingTransaction {
+        entity_actor_ref: ActorRef<EntityActor<E>>,
+        events: Vec<E::Event>,
+        expected_version: ExpectedVersion,
+        correlation_id: Uuid,
+    },
+    /// The command was executed, but no new events due to idempotency
+    Idempotent,
+}
+
+pub enum ExecuteResultIter<E: Entity + Apply + Clone> {
+    Executed(IntoIter<AppendedEvent<E::Event>>),
+    PendingTransaction(IntoIter<E::Event>),
+    Idempotent,
+}
+
+impl<E: Entity + Apply + Clone> Iterator for ExecuteResultIter<E> {
+    type Item = E::Event;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ExecuteResultIter::Executed(events) => events.next().map(|append| append.event),
+            ExecuteResultIter::PendingTransaction(events) => events.next(),
+            ExecuteResultIter::Idempotent => None,
+        }
+    }
+}
+
+impl<E> ExecuteResult<E>
+where
+    E: Entity + Apply + Clone,
+{
+    pub fn len(&self) -> usize {
+        match self {
+            ExecuteResult::Executed(events) => events.len(),
+            ExecuteResult::PendingTransaction { events, .. } => events.len(),
+            ExecuteResult::Idempotent => 0,
+        }
+    }
+
+    pub fn into_iter(self) -> ExecuteResultIter<E> {
+        match self {
+            ExecuteResult::Executed(events) => ExecuteResultIter::Executed(events.into_iter()),
+            ExecuteResult::PendingTransaction { events, .. } => {
+                ExecuteResultIter::PendingTransaction(events.into_iter())
+            }
+            ExecuteResult::Idempotent => ExecuteResultIter::Idempotent,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AppendedEvent<E> {
+    pub event: E,
+    pub event_id: u64,
+    pub stream_version: u64,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct Execute<'a, E, C, T>
 where
     E: Entity,
 {
@@ -145,22 +284,15 @@ where
     expected_version: ExpectedVersion,
     time: DateTime<Utc>,
     executed_at: Instant,
-    tx_sender: Option<TransactionSender>,
+    transaction: T,
     phantom: PhantomData<E>,
 }
 
-pub enum ExecuteResult<E> {
-    /// The command was executed with the resulting events.
-    Executed(Vec<AppendedEvent<E>>),
-    /// The command was executed, but no new events due to idempotency
-    Idempotent,
-}
-
-impl<'a, E, C> Execute<'a, E, C>
+impl<'a, E, C, T> Execute<'a, E, C, T>
 where
     E: Entity,
 {
-    fn new(cmd_service: &'a CommandService, id: E::ID, command: C) -> Self {
+    fn new(cmd_service: &'a CommandService, id: E::ID, command: C, tx: T) -> Self {
         Execute {
             cmd_service,
             id,
@@ -169,7 +301,7 @@ where
             expected_version: ExpectedVersion::Any,
             time: Utc::now(),
             executed_at: Instant::now(),
-            tx_sender: None,
+            transaction: tx,
             phantom: PhantomData,
         }
     }
@@ -207,19 +339,14 @@ where
         self.time = time;
         self
     }
-
-    pub fn transaction(mut self, tx: &Transaction) -> Self {
-        self.tx_sender = Some(tx.sender());
-        self
-    }
 }
 
-impl<'a, E, C> IntoFuture for Execute<'a, E, C>
+impl<'a, E, C> IntoFuture for Execute<'a, E, C, ()>
 where
-    E: Entity + Command<C> + Apply,
-    C: Clone + Send + 'static,
+    E: Entity + Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
 {
-    type Output = Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>;
+    type Output = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
     type IntoFuture = BoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -229,11 +356,11 @@ where
                 .ask(ExecuteMsg {
                     id: self.id,
                     command: self.command,
-                    metadata: self.metadata,
+                    metadata: self.metadata.clone(),
                     expected_version: self.expected_version,
                     time: self.time,
                     executed_at: self.executed_at,
-                    tx_sender: self.tx_sender,
+                    tx_id: None,
                     phantom: PhantomData::<E>,
                 })
                 .send()
@@ -254,11 +381,97 @@ where
     }
 }
 
-pub struct AppendedEvent<E> {
-    pub event: E,
-    pub event_id: u64, // TODO: Make this only available when not using a transaction
-    pub stream_version: u64,
-    pub timestamp: DateTime<Utc>,
+impl<'a, 'b, E, C> IntoFuture for Execute<'a, E, C, &'a mut Transaction<'b>>
+where
+    E: Entity + Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
+{
+    type Output = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
+    type IntoFuture = BoxFuture<'a, Self::Output>;
+
+    fn into_future(mut self) -> Self::IntoFuture {
+        async move {
+            let stream_id = StreamID::new_from_parts(E::name(), &self.id);
+
+            let res = self
+                .cmd_service
+                .actor_ref
+                .ask(ExecuteMsg {
+                    id: self.id,
+                    command: self.command,
+                    metadata: self.metadata.clone(),
+                    expected_version: self.expected_version,
+                    time: self.time,
+                    executed_at: self.executed_at,
+                    tx_id: Some(self.transaction.id()),
+                    phantom: PhantomData::<E>,
+                })
+                .send()
+                .await
+                .map_err(|err| match err {
+                    SendError::ActorNotRunning(_) => ExecuteError::CommandServiceNotRunning,
+                    SendError::ActorStopped => ExecuteError::CommandServiceStopped,
+                    SendError::MailboxFull(_) => {
+                        unreachable!("messages aren't sent to the command service with try_")
+                    }
+                    SendError::HandlerError(err) => err,
+                    SendError::Timeout(_) => {
+                        unreachable!("messages aren't sent to the command service with timeouts")
+                    }
+                })?;
+            match res {
+                ExecuteResult::Executed(_) => panic!("expected pending transaction response"),
+                ExecuteResult::PendingTransaction {
+                    entity_actor_ref,
+                    events,
+                    expected_version,
+                    correlation_id,
+                } => {
+                    self.metadata.correlation_id = correlation_id;
+                    let metadata =
+                        GenericValue(Value::serialized(&self.metadata).map_err(|err| {
+                            ExecuteError::SerializeMetadata(ciborium::ser::Error::Value(
+                                err.to_string(),
+                            ))
+                        })?);
+
+                    let generic_events = events
+                        .iter()
+                        .map(|event| {
+                            let event_type = event.event_type();
+                            let event = GenericValue(Value::serialized(event)?);
+                            Ok((event_type, event))
+                        })
+                        .collect::<anyhow::Result<_>>()
+                        .map_err(|err| {
+                            ExecuteError::SerializeMetadata(ciborium::ser::Error::Value(
+                                err.to_string(),
+                            ))
+                        })?;
+
+                    self.transaction.append(
+                        Box::new(entity_actor_ref.clone()),
+                        AppendEvents {
+                            stream_id,
+                            events: generic_events,
+                            expected_version,
+                            metadata,
+                            timestamp: self.time,
+                        },
+                    );
+
+                    Ok(ExecuteResult::PendingTransaction {
+                        entity_actor_ref,
+                        events,
+                        expected_version,
+                        correlation_id,
+                    })
+                }
+                ExecuteResult::Idempotent => Ok(ExecuteResult::Idempotent),
+            }
+        }
+        .boxed()
+    }
 }
 
 #[derive(Debug)]
@@ -272,16 +485,16 @@ where
     expected_version: ExpectedVersion,
     time: DateTime<Utc>,
     executed_at: Instant,
-    tx_sender: Option<TransactionSender>,
+    tx_id: Option<usize>,
     phantom: PhantomData<E>,
 }
 
 impl<E, C> Message<ExecuteMsg<E, C>> for CommandServiceActor
 where
-    E: Command<C> + Apply,
-    C: Clone + Send + 'static,
+    E: Command<C> + Apply + Clone,
+    C: Clone + Send + Sync + 'static,
 {
-    type Reply = DelegatedReply<Result<ExecuteResult<E::Event>, ExecuteError<E::Error>>>;
+    type Reply = DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>;
 
     async fn handle(
         &mut self,
@@ -295,13 +508,11 @@ where
                 .cloned()
                 .unwrap(),
             None => {
-                let entity_ref = kameo::actor::spawn(EntityActor::new(
-                    E::default(),
-                    stream_name.clone(),
-                    self.event_store.clone(),
-                ));
-
-                entity_ref.link_child(&ctx.actor_ref()).await;
+                let entity_ref = kameo::actor::spawn_link(
+                    &ctx.actor_ref(),
+                    EntityActor::new(E::default(), stream_name.clone(), self.event_store.clone()),
+                )
+                .await;
 
                 self.entities
                     .insert(stream_name, (entity_ref.id(), Box::new(entity_ref.clone())));
@@ -321,7 +532,8 @@ where
                         metadata: msg.metadata,
                         time: msg.time,
                         executed_at: msg.executed_at,
-                        tx_sender: msg.tx_sender,
+                        tx_id: msg.tx_id,
+                        is_buffered: false,
                     })
                     .forward(tx)
                     .await;
@@ -335,7 +547,8 @@ where
                         metadata: msg.metadata,
                         time: msg.time,
                         executed_at: msg.executed_at,
-                        tx_sender: msg.tx_sender,
+                        tx_id: msg.tx_id,
+                        is_buffered: false,
                     })
                     .send()
                     .await;
@@ -343,41 +556,5 @@ where
         }
 
         delegated_reply
-    }
-}
-
-pub struct PrepareStream<E> {
-    pub id: Arc<str>,
-    pub phantom: PhantomData<E>,
-}
-
-impl<E> Message<PrepareStream<E>> for CommandServiceActor
-where
-    E: Entity + Apply + Default + Send + Sync,
-{
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: PrepareStream<E>,
-        ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        let stream_name = StreamID::new_from_parts(E::name(), &msg.id);
-        match self.entities.get(&stream_name) {
-            Some(_) => {}
-            None => {
-                let entity_ref = kameo::spawn(EntityActor::new(
-                    E::default(),
-                    stream_name.clone(),
-                    self.event_store.clone(),
-                ));
-
-                entity_ref.link_child(&ctx.actor_ref()).await;
-
-                self.entities
-                    .insert(stream_name, (entity_ref.id(), Box::new(entity_ref.clone())));
-                entity_ref.wait_startup().await;
-            }
-        };
     }
 }

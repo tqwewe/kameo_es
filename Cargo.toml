@@ -5,30 +5,41 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.82"
+async_fn_traits = "0.1.1"
 async-recursion = "1.1.1"
+bson = { version = "2.13.0", features = ["chrono-0_4", "uuid-1"], optional = true }
 # cbor4ii = { version = "0.3.3", features = ["serde1"] }
 chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2.2"
 eventus = { git = "https://github.com/tqwewe/eventus", branch = "feat/transactions" }
 futures = "0.3.30"
-kameo = "0.12.0"
+im = "15.1.0"
+kameo = { path = "../kameo" } # "0.12.0"
 mongodb = { version = "3.1.0", optional = true }
 polodb_core = { path = "../../PoloDB/PoloDB/src/polodb_core", optional = true } # "5.1.2"
 prost-types = "0.13.1"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "*"
+sqlx = { version = "0.8", features = [ "runtime-tokio" ], optional = true }
 thiserror = "1.0.58"
 tokio = { version = "1.37.0", features = ["full"] }
 tokio-util = "0.7.11"
 tonic = "0.12"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
 uuid = { version = "1.10", features = ["serde", "v4"] }
 
 [features]
-default = ["mongodb"]
+default = []
 mongodb = [
+  "dep:bson",
   "dep:mongodb"
 ]
 polodb = [
   "dep:polodb_core"
+]
+postgres = [
+  "dep:sqlx",
+  "sqlx/postgres",
+  "sqlx/uuid"
 ]
