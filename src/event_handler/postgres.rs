@@ -4,9 +4,10 @@ use std::{
     marker::PhantomData,
     ops,
     sync::Arc,
+    time::Duration,
 };
 
-use futures::{Future, FutureExt};
+use futures::Future;
 use kameo::{
     actor::{ActorID, ActorRef, WeakActorRef},
     error::{ActorStopReason, BoxError, PanicError},
@@ -188,18 +189,21 @@ where
             let correlation_worker_ref;
             match entry {
                 Entry::Vacant(vacancy) => {
-                    let worker_ref = kameo::spawn(CorrelationWorker {
-                        correlation_id: event.metadata.correlation_id,
-                        pool: self.pool.clone(),
-                        checkpoints_table: self.checkpoints_table.clone(),
-                        projection_id: self.projection_id.clone(),
-                        handler: self.handler.clone(),
-                        last_handled_event: None,
-                        flush_interval: self.flush_interval,
-                        global_offset_actor: self.global_offset_actor.clone(),
-                        phantom: PhantomData,
-                    });
-                    worker_ref.link_child(&ctx.actor_ref()).await;
+                    let worker_ref = kameo::actor::spawn_link(
+                        &ctx.actor_ref(),
+                        CorrelationWorker {
+                            correlation_id: event.metadata.correlation_id,
+                            pool: self.pool.clone(),
+                            checkpoints_table: self.checkpoints_table.clone(),
+                            projection_id: self.projection_id.clone(),
+                            handler: self.handler.clone(),
+                            last_handled_event: None,
+                            flush_interval: self.flush_interval,
+                            global_offset_actor: self.global_offset_actor.clone(),
+                            phantom: PhantomData,
+                        },
+                    )
+                    .await;
 
                     correlation_worker_ref = vacancy.insert(worker_ref);
                 }
@@ -426,6 +430,7 @@ struct GlobalOffsetActor {
     processing_event_ids: VecDeque<(u64, OwnedSemaphorePermit)>,
     processed_event_ids: HashSet<u64>,
     global_offset: Option<u64>,
+    persist_scheduled: bool,
 }
 
 impl Actor for GlobalOffsetActor {
@@ -467,6 +472,7 @@ impl GlobalOffsetActor {
             processing_event_ids: VecDeque::new(),
             processed_event_ids: HashSet::new(),
             global_offset: None,
+            persist_scheduled: false,
         }
     }
 
@@ -476,33 +482,16 @@ impl GlobalOffsetActor {
     }
 
     #[message]
-    async fn finish_processing(&mut self, event_id: u64) -> Result<(), sqlx::Error> {
-        self.processed_event_ids.insert(event_id);
-
-        let old_global_offset = self.global_offset;
-        loop {
-            if let Some((front_event_id, _)) = self.processing_event_ids.front() {
-                if self.processed_event_ids.remove(&front_event_id) {
-                    self.global_offset = Some(*front_event_id);
-                    self.processing_event_ids.pop_front();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        if old_global_offset != self.global_offset {
-            self.persist_global_offset().await?;
-        }
-
-        Ok(())
+    fn get_global_offset(&self) -> Option<u64> {
+        self.global_offset
     }
 
     #[message]
-    fn get_global_offset(&self) -> Option<u64> {
-        self.global_offset
+    async fn persist_offset(&mut self) -> Result<(), sqlx::Error> {
+        self.persist_scheduled = false;
+        self.persist_global_offset().await?;
+
+        Ok(())
     }
 
     // Persist the global offset to the database
@@ -524,6 +513,49 @@ impl GlobalOffsetActor {
         .await?;
 
         info!("persisted global_offset: {global_offset}");
+
+        Ok(())
+    }
+}
+
+struct FinishProcessing {
+    event_id: u64,
+}
+
+impl Message<FinishProcessing> for GlobalOffsetActor {
+    type Reply = Result<(), sqlx::Error>;
+
+    async fn handle(
+        &mut self,
+        msg: FinishProcessing,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.processed_event_ids.insert(msg.event_id);
+
+        let old_global_offset = self.global_offset;
+        loop {
+            if let Some((front_event_id, _)) = self.processing_event_ids.front() {
+                if self.processed_event_ids.remove(&front_event_id) {
+                    self.global_offset = Some(*front_event_id);
+                    self.processing_event_ids.pop_front();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if old_global_offset != self.global_offset {
+            if !self.persist_scheduled {
+                self.persist_scheduled = true;
+                let actor_ref = ctx.actor_ref();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let _ = actor_ref.tell(PersistOffset).await;
+                });
+            }
+        }
 
         Ok(())
     }

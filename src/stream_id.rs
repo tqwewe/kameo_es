@@ -215,6 +215,12 @@ impl StreamID {
     }
 }
 
+impl From<StreamID> for String {
+    fn from(stream_id: StreamID) -> Self {
+        stream_id.into_inner()
+    }
+}
+
 impl fmt::Display for StreamID {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
