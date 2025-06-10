@@ -5,7 +5,8 @@ use eventus::{
     server::{
         eventstore::{
             event_store_client::EventStoreClient, AppendToMultipleStreamsRequest,
-            AppendToStreamRequest, GetStreamEventsRequest, NewEvent, StreamEvents,
+            AppendToStreamRequest, GetLastEventIdRequest, GetStreamEventsRequest, NewEvent,
+            StreamEvents,
         },
         ClientAuthInterceptor,
     },
@@ -16,7 +17,7 @@ use prost_types::Timestamp;
 use serde::Serialize;
 use tonic::{service::interceptor::InterceptedService, transport::Channel, Code, Status};
 
-use crate::{stream_id::StreamID, Error, EventType, GenericValue};
+use crate::{Error, EventType, GenericValue, StreamID};
 
 #[derive(Clone, Debug)]
 pub struct EventStore {
@@ -254,6 +255,15 @@ impl EventStore {
             .collect();
 
         Ok(results)
+    }
+
+    pub async fn get_last_event_id(&mut self) -> Result<Option<u64>, Status> {
+        Ok(self
+            .client
+            .get_last_event_id(GetLastEventIdRequest {})
+            .await?
+            .into_inner()
+            .last_event_id)
     }
 }
 

@@ -1,0 +1,12 @@
+[package]
+name = "kameo_es_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kameo_es_macros = { path = "../macros" }
+
+chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2.2"
+serde = { version = "1.0.197", features = ["derive"] }
+uuid = { version = "1.10", features = ["serde", "v4"] }

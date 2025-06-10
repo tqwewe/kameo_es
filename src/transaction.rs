@@ -12,9 +12,12 @@ use kameo::{
     Actor,
 };
 
-use crate::{
-    command_service::CommandService, event_store::AppendEvents, stream_id::StreamID, GenericValue,
-};
+use crate::{command_service::CommandService, event_store::AppendEvents, GenericValue, StreamID};
+
+pub enum TransactionOutcome<C = (), A = ()> {
+    Commit(C),
+    Abort(A),
+}
 
 pub struct Transaction<'a> {
     id: usize,
@@ -42,14 +45,22 @@ impl<'a> Transaction<'a> {
         self.id
     }
 
+    pub(crate) fn is_registered(&mut self, stream_id: &StreamID) -> bool {
+        self.entities.contains_key(&stream_id)
+    }
+
+    pub(crate) fn register_entity(
+        &mut self,
+        stream_id: StreamID,
+        entity_actor_ref: Box<dyn EntityTransaction>,
+    ) {
+        self.entities.entry(stream_id).or_insert(entity_actor_ref);
+    }
+
     pub(crate) fn append(
         &mut self,
-        entity_actor_ref: Box<dyn EntityTransaction>,
         append: AppendEvents<(&'static str, GenericValue), GenericValue>,
     ) {
-        self.entities
-            .entry(append.stream_id.clone())
-            .or_insert(entity_actor_ref);
         self.appends.push(append);
     }
 
@@ -79,12 +90,23 @@ impl<'a> Transaction<'a> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct BeginTransaction {
+    pub(crate) tx_id: usize,
+    pub(crate) is_buffered: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct CommitTransaction {
     pub(crate) tx_id: usize,
 }
+
+#[derive(Debug)]
 pub(crate) struct ResetTransaction {
     pub(crate) tx_id: usize,
 }
+
+#[derive(Debug)]
 pub(crate) struct AbortTransaction {
     pub(crate) tx_id: usize,
 }

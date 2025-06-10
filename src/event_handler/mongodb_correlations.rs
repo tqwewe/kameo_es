@@ -1,7 +1,5 @@
 use std::{collections::HashMap, fmt, marker::PhantomData, sync::Arc};
 
-use bson::bson;
-use futures::FutureExt;
 use kameo::{
     actor::{ActorID, ActorRef, WeakActorRef},
     error::{ActorStopReason, BoxError, PanicError},
@@ -140,10 +138,10 @@ where
                     flush_interval: self.flush_interval,
                     phantom: PhantomData,
                 });
-                worker_ref
-                    .link_child(&ctx.actor_ref())
-                    .now_or_never()
-                    .unwrap();
+                // worker_ref
+                //     .link_child(&ctx.actor_ref())
+                //     .now_or_never()
+                //     .unwrap();
 
                 worker_ref
             });
@@ -288,8 +286,8 @@ where
                 }
             }
 
+            let mut attempt = 1;
             loop {
-                let mut attempt = 1;
                 let res = session.commit_transaction().await;
                 match res {
                     Ok(()) => {

@@ -29,7 +29,7 @@ use tonic::{
 };
 use tracing::info;
 
-use crate::{Entity, Event};
+use crate::{event_from_eventus, Entity, Event};
 
 pub trait EventProcessor<E, H>
 where
@@ -240,7 +240,7 @@ async fn event_handler_stream_next<E>(
     Option<Result<UnprocessedEvent<E>, Status>>,
 ) {
     match event_batch.next() {
-        Some(event) => match Event::try_from(event) {
+        Some(event) => match event_from_eventus(event) {
             Ok(event) => (stream, event_batch, Some(Ok(UnprocessedEvent::new(event)))),
             Err(_) => (
                 stream,
@@ -252,7 +252,7 @@ async fn event_handler_stream_next<E>(
             Some(Ok(EventBatch { events })) => {
                 let mut event_batch = events.into_iter();
                 match event_batch.next() {
-                    Some(event) => match Event::try_from(event) {
+                    Some(event) => match event_from_eventus(event) {
                         Ok(event) => (stream, event_batch, Some(Ok(UnprocessedEvent::new(event)))),
                         Err(_) => (
                             stream,

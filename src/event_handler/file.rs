@@ -60,6 +60,14 @@ impl<H> FileEventProcessor<H> {
         })
     }
 
+    pub fn handler(&mut self) -> &mut H {
+        &mut self.handler
+    }
+
+    pub fn into_handler(self) -> H {
+        self.handler
+    }
+
     pub fn flush_interval(mut self, events: u64) -> Self {
         self.flush_interval = events;
         self

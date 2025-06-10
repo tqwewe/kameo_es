@@ -5,7 +5,7 @@ use thiserror::Error;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::stream_id::StreamID;
+use crate::StreamID;
 
 #[derive(Debug, Error)]
 pub enum ExecuteError<E> {

@@ -256,6 +256,103 @@ struct CorrelationWorker<E, H> {
     phantom: PhantomData<fn() -> E>,
 }
 
+impl<E, H> CorrelationWorker<E, H> {
+    async fn handle_event(
+        &mut self,
+        event: Event,
+    ) -> Result<
+        (),
+        EventHandlerError<PostgresEventProcessorError, <H as EventHandler<Transaction>>::Error>,
+    >
+    where
+        E: 'static,
+        H: EventHandler<Transaction>
+            + CompositeEventHandler<E, Transaction, PostgresEventProcessorError>
+            + Send
+            + 'static,
+        H::Error: fmt::Debug + Sync,
+    {
+        if self.last_handled_event >= Some(event.id) {
+            debug!("ignoring already handled event {}", event.id);
+            return Ok(());
+        }
+        let mut tx = Transaction::new(self.pool.begin().await?);
+        let event_id = event.id;
+        let res = self.handler.composite_handle(&mut tx, event).await;
+        if res.is_err() {
+            tx.tx.rollback().await?;
+            return res.map_err(|e| e.into());
+        }
+
+        let Transaction { mut tx, dirty } = tx;
+
+        let events_since_last_flush = self
+            .last_handled_event
+            .map(|last| event_id.saturating_sub(last))
+            .unwrap_or(u64::MAX);
+        if dirty || events_since_last_flush > self.flush_interval {
+            match self.last_handled_event {
+                Some(last_handled_event) => {
+                    let res = sqlx::query(&format!(
+                        "
+                                UPDATE {} SET last_event_id = $1
+                                WHERE projection_id = $2 AND correlation_id = $3
+                            ",
+                        self.checkpoints_table
+                    ))
+                    .bind(event_id as i64)
+                    .bind(self.projection_id.as_ref())
+                    .bind(self.correlation_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if res.rows_affected() == 0 {
+                        return Err(EventHandlerError::Processor(
+                            PostgresEventProcessorError::UnexpectedLastEventId {
+                                expected: Some(last_handled_event),
+                            },
+                        ));
+                    }
+                }
+                None => {
+                    let res = sqlx::query(
+                                &format!(
+                                    "INSERT INTO {} (projection_id, correlation_id, last_event_id) VALUES ($1, $2, $3)",
+                                    self.checkpoints_table
+                                ),
+                            )
+                            .bind(self.projection_id.as_ref())
+                            .bind(self.correlation_id)
+                            .bind(event_id as i64)
+                            .execute(&mut *tx)
+                            .await;
+
+                    match res {
+                        Ok(_) => {}
+                        Err(sqlx::Error::Database(db_err))
+                            if db_err.code().as_deref() == Some("23505") =>
+                        {
+                            // 23505 is the error code for unique violations (e.g., primary key conflicts)
+                            return Err(EventHandlerError::Processor(
+                                PostgresEventProcessorError::UnexpectedLastEventId {
+                                    expected: None,
+                                },
+                            ));
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            }
+
+            tx.commit().await?;
+            self.last_handled_event = Some(event_id);
+        } else {
+            debug!("ignoring event");
+        }
+
+        Ok(())
+    }
+}
+
 impl<E: 'static, H: Send + 'static> Actor for CorrelationWorker<E, H> {
     type Mailbox = UnboundedMailbox<Self>;
 
@@ -333,91 +430,27 @@ where
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> impl Future<Output = Self::Reply> + Send {
         async move {
-            let mut tx = Transaction::new(self.pool.begin().await?);
             let event_id = event.id;
-            let res = self.handler.composite_handle(&mut tx, event).await;
-            if res.is_err() {
-                tx.tx.rollback().await?;
-                return res.map_err(|e| e.into());
-            }
+            match self.handle_event(event).await {
+                Ok(()) => {
+                    // Notify the GlobalOffsetActor about the new event id.
+                    self.global_offset_actor
+                        .tell(FinishProcessing { event_id })
+                        .send()
+                        .await
+                        .map_err(|_| {
+                            EventHandlerError::Processor(PostgresEventProcessorError::Postgres(
+                                sqlx::Error::RowNotFound, // Replace with appropriate error
+                            ))
+                        })?;
 
-            let Transaction { mut tx, dirty } = tx;
-
-            let events_since_last_flush = self
-                .last_handled_event
-                .map(|last| event_id - last)
-                .unwrap_or(u64::MAX);
-            if dirty || events_since_last_flush > self.flush_interval {
-                match self.last_handled_event {
-                    Some(last_handled_event) => {
-                        let res = sqlx::query(&format!(
-                            "
-                                UPDATE {} SET last_event_id = $1
-                                WHERE projection_id = $2 AND correlation_id = $3
-                            ",
-                            self.checkpoints_table
-                        ))
-                        .bind(event_id as i64)
-                        .bind(self.projection_id.as_ref())
-                        .bind(self.correlation_id)
-                        .execute(&mut *tx)
-                        .await?;
-                        if res.rows_affected() == 0 {
-                            return Err(EventHandlerError::Processor(
-                                PostgresEventProcessorError::UnexpectedLastEventId {
-                                    expected: Some(last_handled_event),
-                                },
-                            ));
-                        }
-                    }
-                    None => {
-                        let res = sqlx::query(
-                                &format!(
-                                    "INSERT INTO {} (projection_id, correlation_id, last_event_id) VALUES ($1, $2, $3)",
-                                    self.checkpoints_table
-                                ),
-                            )
-                            .bind(self.projection_id.as_ref())
-                            .bind(self.correlation_id)
-                            .bind(event_id as i64)
-                            .execute(&mut *tx)
-                            .await;
-
-                        match res {
-                            Ok(_) => {}
-                            Err(sqlx::Error::Database(db_err))
-                                if db_err.code().as_deref() == Some("23505") =>
-                            {
-                                // 23505 is the error code for unique violations (e.g., primary key conflicts)
-                                return Err(EventHandlerError::Processor(
-                                    PostgresEventProcessorError::UnexpectedLastEventId {
-                                        expected: None,
-                                    },
-                                ));
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
+                    Ok(())
                 }
-
-                tx.commit().await?;
-                self.last_handled_event = Some(event_id);
-            } else {
-                debug!("ignoring event");
+                Err(err) => {
+                    self.global_offset_actor.kill();
+                    Err(err)
+                }
             }
-
-            // Notify the GlobalOffsetActor about the new event id.
-            self.global_offset_actor
-                .tell(FinishProcessing { event_id })
-                .send()
-                .await
-                .map_err(|_| {
-                    EventHandlerError::Processor(PostgresEventProcessorError::Postgres(
-                        sqlx::Error::RowNotFound, // Replace with appropriate error
-                    ))
-                })?;
-
-            Ok(())
         }
     }
 }

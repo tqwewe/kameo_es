@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Instant};
+use std::{collections::VecDeque, fmt, time::Instant};
 
 use chrono::{DateTime, Utc};
 use eventus::{CurrentVersion, ExpectedVersion};
@@ -6,23 +6,22 @@ use futures::StreamExt;
 use im::HashMap;
 use kameo::{
     actor::{ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, PanicError, SendError},
+    error::{ActorStopReason, BoxError, Infallible, PanicError, SendError},
     mailbox::unbounded::UnboundedMailbox,
-    message::{BoxMessage, Context, Message},
+    message::{Context, DynMessage, Message},
     reply::{BoxReplySender, DelegatedReply},
     Actor,
 };
 use tonic::Status;
-use tracing::{debug, error};
+use tracing::{debug, error, instrument};
 use uuid::Uuid;
 
 use crate::{
     command_service::{AppendedEvent, ExecuteResult},
     error::ExecuteError,
     event_store::{AppendEventsError, EventStore},
-    stream_id::StreamID,
-    transaction::{AbortTransaction, CommitTransaction, ResetTransaction},
-    Apply, CausationMetadata, Command, Entity, Metadata,
+    transaction::{AbortTransaction, BeginTransaction, CommitTransaction, ResetTransaction},
+    Apply, CausationMetadata, Command, Entity, Metadata, StreamID,
 };
 
 pub struct EntityActor<E: Entity + Apply + Clone> {
@@ -32,7 +31,7 @@ pub struct EntityActor<E: Entity + Apply + Clone> {
     transaction: Option<(usize, EntityActorState<E>)>,
     conflict_reties: usize,
     buffered_commands: VecDeque<(
-        BoxMessage<EntityActor<E>>,
+        Box<dyn DynMessage<EntityActor<E>>>,
         ActorRef<Self>,
         Option<BoxReplySender>,
     )>,
@@ -100,7 +99,7 @@ where
     where
         E: Command<C>,
     {
-        if expected_version.validate(self.version).is_err() {
+        if !expected_version.validate(self.version) {
             return Err(ExecuteError::IncorrectExpectedVersion {
                 stream_id: StreamID::new_from_parts(E::name(), id),
                 current: self.version,
@@ -281,6 +280,21 @@ impl<E: Entity + Apply + Clone> EntityActor<E> {
         Ok(appended)
     }
 
+    fn buffer_begin_transaction(
+        &mut self,
+        mut msg: BeginTransaction,
+        mut ctx: Context<'_, Self, DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>>,
+    ) -> DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>> {
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+        msg.is_buffered = true;
+        self.buffered_commands.push_back((
+            Box::new(msg),
+            ctx.actor_ref(),
+            reply_sender.map(|tx| tx.boxed()),
+        ));
+        delegated_reply
+    }
+
     fn buffer_command<C>(
         &mut self,
         mut exec: Execute<E::ID, C, E::Metadata>,
@@ -292,7 +306,9 @@ impl<E: Entity + Apply + Clone> EntityActor<E> {
     ) -> DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>
     where
         E: Command<C>,
-        C: Clone + Send + 'static,
+        E::ID: fmt::Debug,
+        E::Metadata: fmt::Debug,
+        C: fmt::Debug + Clone + Send + 'static,
     {
         let (delegated_reply, reply_sender) = ctx.reply_sender();
         exec.is_buffered = true;
@@ -339,6 +355,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct Execute<I, C, M> {
     pub id: I,
     pub command: C,
@@ -353,10 +370,13 @@ pub struct Execute<I, C, M> {
 impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityActor<E>
 where
     E: Entity + Command<C> + Apply + Clone,
-    C: Clone + Send + 'static,
+    E::ID: fmt::Debug,
+    E::Metadata: fmt::Debug,
+    C: fmt::Debug + Clone + Send + 'static,
 {
     type Reply = DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>;
 
+    #[instrument(name = "handle_execute", skip(self, ctx))]
     async fn handle(
         &mut self,
         mut exec: Execute<E::ID, C, E::Metadata>,
@@ -368,9 +388,8 @@ where
 
         match (&self.transaction, exec.tx_id) {
             (None, None) => {} // No transaction, continue processing
-            (None, Some(tx_id)) => {
-                // New transaction, continue processing
-                self.transaction = Some((tx_id, self.state.clone()));
+            (None, Some(_)) => {
+                panic!("command being executed without beginning a transaction");
             }
             (Some(_), None) => {
                 // Existing transaction, buffer
@@ -461,6 +480,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct ProcessNextBufferedCommand;
 
 impl<E> Message<ProcessNextBufferedCommand> for EntityActor<E>
@@ -469,6 +489,7 @@ where
 {
     type Reply = ();
 
+    #[instrument(name = "handle_process_next_buffered_command", skip(self, ctx))]
     async fn handle(
         &mut self,
         _msg: ProcessNextBufferedCommand,
@@ -477,7 +498,7 @@ where
         self.is_processing_buffered_commands = true;
 
         if let Some((exec, actor_ref, tx)) = self.buffered_commands.pop_front() {
-            if let Err(err) = exec.handle_dyn(self, actor_ref, tx).await {
+            if let Some(err) = exec.handle_dyn(self, actor_ref, tx).await {
                 std::panic::resume_unwind(Box::new(err));
             }
         }
@@ -491,12 +512,48 @@ where
     }
 }
 
+impl<E> Message<BeginTransaction> for EntityActor<E>
+where
+    E: Entity + Apply + Clone,
+{
+    type Reply = DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>;
+
+    #[instrument(name = "handle_prepare_transaction", skip(self, ctx))]
+    async fn handle(
+        &mut self,
+        msg: BeginTransaction,
+        mut ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if !msg.is_buffered && self.is_processing_buffered_commands {
+            // Message is no buffered and we are processing buffered commands, so we'll buffer this
+            return self.buffer_begin_transaction(msg, ctx);
+        }
+
+        match &self.transaction {
+            Some((existing_tx_id, _)) => {
+                if existing_tx_id == &msg.tx_id {
+                    panic!("attempted to begin the same transaction multiple times");
+                }
+
+                // We're already in a transaction, so we'll buffer this transaction begin request
+                self.buffer_begin_transaction(msg, ctx)
+            }
+            None => {
+                // We're not in a transaction, so we can begin a new one
+                self.transaction = Some((msg.tx_id, self.state.clone()));
+                ctx.reply(Ok(ctx.actor_ref()))
+            }
+        }
+    }
+}
+
 impl<E> Message<CommitTransaction> for EntityActor<E>
 where
     E: Entity + Apply + Clone,
 {
     type Reply = ();
 
+    #[instrument(name = "handle_commit_transaction", skip(self, ctx))]
     async fn handle(
         &mut self,
         msg: CommitTransaction,
@@ -524,6 +581,7 @@ where
 {
     type Reply = anyhow::Result<()>;
 
+    #[instrument(name = "handle_reset_transaction", skip(self, _ctx))]
     async fn handle(
         &mut self,
         msg: ResetTransaction,
@@ -547,6 +605,7 @@ where
 {
     type Reply = ();
 
+    #[instrument(name = "handle_abort_transaction", skip(self, ctx))]
     async fn handle(
         &mut self,
         msg: AbortTransaction,

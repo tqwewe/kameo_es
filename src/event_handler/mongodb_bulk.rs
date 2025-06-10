@@ -15,7 +15,7 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::Event;
 
@@ -153,7 +153,6 @@ impl<H> MongoDBBulkEventProcessor<H> {
             }
         };
         if exceeded_flush_interval_events {
-            dbg!(last_flushed.1, self.last_handled_event);
             return Some(FlushReason::EventsInterval);
         }
         if last_flushed.0.elapsed() >= self.flush_interval_time {
@@ -203,10 +202,11 @@ impl<H> MongoDBBulkEventProcessor<H> {
             .await;
             match res {
                 Ok(()) => {
-                    session.commit_transaction().await?;
+                    session.commit_transaction().await.unwrap();
                 }
                 Err(err) => {
                     let _ = session.abort_transaction().await;
+                    error!("{err}");
                     return Err(err);
                 }
             }
@@ -269,6 +269,7 @@ impl<H> MongoDBBulkEventProcessor<H> {
         }
 
         if !models.is_empty() {
+            println!("writing {} models", models.len());
             client.bulk_write(models).session(&mut *session).await?;
         }
 

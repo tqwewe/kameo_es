@@ -1,11 +1,16 @@
+[workspace]
+resolver = "2"
+members = [".", "core", "macros"]
+
 [package]
 name = "kameo_es"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+kameo_es_core = { path = "core" }
+
 anyhow = "1.0.82"
-async_fn_traits = "0.1.1"
 async-recursion = "1.1.1"
 bson = { version = "2.13.0", features = ["chrono-0_4", "uuid-1"], optional = true }
 # cbor4ii = { version = "0.3.3", features = ["serde1"] }
@@ -14,7 +19,7 @@ ciborium = "0.2.2"
 eventus = { git = "https://github.com/tqwewe/eventus", branch = "feat/transactions" }
 futures = "0.3.30"
 im = "15.1.0"
-kameo = { path = "../kameo" } # "0.12.0"
+kameo = "0.13.0"
 mongodb = { version = "3.1.0", optional = true }
 polodb_core = { path = "../../PoloDB/PoloDB/src/polodb_core", optional = true } # "5.1.2"
 prost-types = "0.13.1"
@@ -22,7 +27,7 @@ serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "*"
 sqlx = { version = "0.8", features = [ "runtime-tokio" ], optional = true }
 thiserror = "1.0.58"
-tokio = { version = "1.37.0", features = ["full"] }
+tokio = { version = "1.37.0", features = ["sync"] }
 tokio-util = "0.7.11"
 tonic = "0.12"
 tracing = "0.1"

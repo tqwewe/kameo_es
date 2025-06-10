@@ -13,7 +13,7 @@ use eventus::{
 use futures::{future::BoxFuture, FutureExt};
 use kameo::{
     actor::{ActorID, ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, PanicError, SendError},
+    error::{ActorStopReason, BoxError, Infallible, PanicError, SendError},
     mailbox::bounded::BoundedMailbox,
     message::{Context, Message},
     reply::DelegatedReply,
@@ -28,9 +28,8 @@ use crate::{
     entity_actor::{self, EntityActor},
     error::ExecuteError,
     event_store::{AppendEvents, AppendEventsError, EventStore},
-    stream_id::StreamID,
-    transaction::Transaction,
-    Apply, CausationMetadata, Command, Entity, Event, EventType, GenericValue, Metadata,
+    transaction::{self, Transaction, TransactionOutcome},
+    Apply, CausationMetadata, Command, Entity, Event, EventType, GenericValue, Metadata, StreamID,
 };
 
 #[derive(Clone, Debug)]
@@ -59,15 +58,15 @@ impl CommandService {
 
     /// Returns a reference to the inner event store.
     #[inline]
-    pub fn event_store(&self) -> &EventStore {
-        &self.event_store
+    pub fn event_store(&mut self) -> &mut EventStore {
+        &mut self.event_store
     }
 
     /// Starts a transaction.
-    pub async fn transaction<T, F>(&mut self, mut f: F) -> anyhow::Result<T>
-    where
-        F: FnMut(Transaction<'_>) -> BoxFuture<'_, anyhow::Result<T>>,
-    {
+    pub async fn transaction<C, A>(
+        &mut self,
+        mut f: impl FnMut(Transaction<'_>) -> BoxFuture<'_, anyhow::Result<TransactionOutcome<C, A>>>,
+    ) -> anyhow::Result<TransactionOutcome<C, A>> {
         let id = Transaction::get_id();
         let mut entities = HashMap::new();
         let mut appends = Vec::new();
@@ -76,14 +75,14 @@ impl CommandService {
             let tx = Transaction::new(id, self, &mut entities, &mut appends);
             let res = f(tx).await;
             match res {
-                Ok(val) => {
+                Ok(TransactionOutcome::Commit(val)) => {
                     let current_appends: Vec<_> = appends
                         .drain(..)
                         .filter(|append| !append.events.is_empty())
                         .collect();
                     if current_appends.is_empty() {
                         Transaction::new(id, self, &mut entities, &mut appends).committed();
-                        return Ok(val);
+                        return Ok(TransactionOutcome::Commit(val));
                     }
 
                     // Attempt the transaction
@@ -91,7 +90,7 @@ impl CommandService {
                     match res {
                         Ok(_) => {
                             Transaction::new(id, self, &mut entities, &mut appends).committed();
-                            return Ok(val);
+                            return Ok(TransactionOutcome::Commit(val));
                         }
                         Err(AppendEventsError::IncorrectExpectedVersion {
                             stream_id,
@@ -113,6 +112,10 @@ impl CommandService {
                             return Err(err.into());
                         }
                     }
+                }
+                Ok(TransactionOutcome::Abort(val)) => {
+                    Transaction::new(id, self, &mut entities, &mut appends).abort();
+                    return Ok(TransactionOutcome::Abort(val));
                 }
                 Err(err) => {
                     Transaction::new(id, self, &mut entities, &mut appends).abort();
@@ -344,7 +347,9 @@ where
 impl<'a, E, C> IntoFuture for Execute<'a, E, C, ()>
 where
     E: Entity + Command<C> + Apply + Clone,
-    C: Clone + Send + Sync + 'static,
+    E::ID: fmt::Debug,
+    E::Metadata: fmt::Debug,
+    C: fmt::Debug + Clone + Send + Sync + 'static,
 {
     type Output = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
     type IntoFuture = BoxFuture<'a, Self::Output>;
@@ -384,7 +389,9 @@ where
 impl<'a, 'b, E, C> IntoFuture for Execute<'a, E, C, &'a mut Transaction<'b>>
 where
     E: Entity + Command<C> + Apply + Clone,
-    C: Clone + Send + Sync + 'static,
+    E::ID: fmt::Debug + Clone,
+    E::Metadata: fmt::Debug,
+    C: fmt::Debug + Clone + Send + Sync + 'static,
 {
     type Output = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
     type IntoFuture = BoxFuture<'a, Self::Output>;
@@ -392,6 +399,34 @@ where
     fn into_future(mut self) -> Self::IntoFuture {
         async move {
             let stream_id = StreamID::new_from_parts(E::name(), &self.id);
+            if !self.transaction.is_registered(&stream_id) {
+                // Register this entity so it knows its in a transaction
+                let entity_actor_ref = self
+                    .cmd_service
+                    .actor_ref
+                    .ask(BeginTransaction {
+                        id: self.id.clone(),
+                        tx_id: self.transaction.id(),
+                        phantom: PhantomData::<E>,
+                    })
+                    .send()
+                    .await
+                    .map_err(|err| match err {
+                        SendError::ActorNotRunning(_) => ExecuteError::CommandServiceNotRunning,
+                        SendError::ActorStopped => ExecuteError::CommandServiceStopped,
+                        SendError::MailboxFull(_) => {
+                            unreachable!("messages aren't sent to the command service with try_")
+                        }
+                        SendError::HandlerError(_) => unreachable!(),
+                        SendError::Timeout(_) => {
+                            unreachable!(
+                                "messages aren't sent to the command service with timeouts"
+                            )
+                        }
+                    })?;
+                self.transaction
+                    .register_entity(stream_id.clone(), Box::new(entity_actor_ref));
+            };
 
             let res = self
                 .cmd_service
@@ -449,16 +484,13 @@ where
                             ))
                         })?;
 
-                    self.transaction.append(
-                        Box::new(entity_actor_ref.clone()),
-                        AppendEvents {
-                            stream_id,
-                            events: generic_events,
-                            expected_version,
-                            metadata,
-                            timestamp: self.time,
-                        },
-                    );
+                    self.transaction.append(AppendEvents {
+                        stream_id,
+                        events: generic_events,
+                        expected_version,
+                        metadata,
+                        timestamp: self.time,
+                    });
 
                     Ok(ExecuteResult::PendingTransaction {
                         entity_actor_ref,
@@ -471,6 +503,36 @@ where
             }
         }
         .boxed()
+    }
+}
+
+impl CommandServiceActor {
+    async fn get_or_start_entity_actor<E>(
+        &mut self,
+        cmd_service_actor_ref: &ActorRef<Self>,
+        stream_id: StreamID,
+    ) -> ActorRef<EntityActor<E>>
+    where
+        E: Entity + Apply + Clone,
+    {
+        match self.entities.get(&stream_id) {
+            Some((_, actor_ref)) => actor_ref
+                .downcast_ref::<ActorRef<EntityActor<E>>>()
+                .cloned()
+                .unwrap(),
+            None => {
+                let entity_ref = kameo::actor::spawn_link(
+                    &cmd_service_actor_ref,
+                    EntityActor::new(E::default(), stream_id.clone(), self.event_store.clone()),
+                )
+                .await;
+
+                self.entities
+                    .insert(stream_id, (entity_ref.id(), Box::new(entity_ref.clone())));
+
+                entity_ref
+            }
+        }
     }
 }
 
@@ -492,7 +554,9 @@ where
 impl<E, C> Message<ExecuteMsg<E, C>> for CommandServiceActor
 where
     E: Command<C> + Apply + Clone,
-    C: Clone + Send + Sync + 'static,
+    E::ID: fmt::Debug,
+    E::Metadata: fmt::Debug,
+    C: fmt::Debug + Clone + Send + Sync + 'static,
 {
     type Reply = DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>;
 
@@ -501,57 +565,71 @@ where
         msg: ExecuteMsg<E, C>,
         mut ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let stream_name = StreamID::new_from_parts(E::name(), &msg.id);
-        let entity_ref = match self.entities.get(&stream_name) {
-            Some((_, actor_ref)) => actor_ref
-                .downcast_ref::<ActorRef<EntityActor<E>>>()
-                .cloned()
-                .unwrap(),
-            None => {
-                let entity_ref = kameo::actor::spawn_link(
-                    &ctx.actor_ref(),
-                    EntityActor::new(E::default(), stream_name.clone(), self.event_store.clone()),
-                )
-                .await;
-
-                self.entities
-                    .insert(stream_name, (entity_ref.id(), Box::new(entity_ref.clone())));
-
-                entity_ref
-            }
-        };
+        let stream_id = StreamID::new_from_parts(E::name(), &msg.id);
+        let entity_ref = self
+            .get_or_start_entity_actor::<E>(&ctx.actor_ref(), stream_id)
+            .await;
 
         let (delegated_reply, reply_sender) = ctx.reply_sender();
+        let exec = entity_actor::Execute {
+            id: msg.id,
+            command: msg.command,
+            expected_version: msg.expected_version,
+            metadata: msg.metadata,
+            time: msg.time,
+            executed_at: msg.executed_at,
+            tx_id: msg.tx_id,
+            is_buffered: false,
+        };
         match reply_sender {
             Some(tx) => {
-                let _ = entity_ref
-                    .ask(entity_actor::Execute {
-                        id: msg.id,
-                        command: msg.command,
-                        expected_version: msg.expected_version,
-                        metadata: msg.metadata,
-                        time: msg.time,
-                        executed_at: msg.executed_at,
-                        tx_id: msg.tx_id,
-                        is_buffered: false,
-                    })
-                    .forward(tx)
-                    .await;
+                let _ = entity_ref.ask(exec).forward(tx).await;
             }
             None => {
-                let _ = entity_ref
-                    .tell(entity_actor::Execute {
-                        id: msg.id,
-                        command: msg.command,
-                        expected_version: msg.expected_version,
-                        metadata: msg.metadata,
-                        time: msg.time,
-                        executed_at: msg.executed_at,
-                        tx_id: msg.tx_id,
-                        is_buffered: false,
-                    })
-                    .send()
-                    .await;
+                let _ = entity_ref.tell(exec).send().await;
+            }
+        }
+
+        delegated_reply
+    }
+}
+
+struct BeginTransaction<E>
+where
+    E: Entity,
+{
+    id: E::ID,
+    tx_id: usize,
+    phantom: PhantomData<E>,
+}
+
+impl<E> Message<BeginTransaction<E>> for CommandServiceActor
+where
+    E: Entity + Apply + Clone,
+{
+    type Reply = DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>;
+
+    async fn handle(
+        &mut self,
+        msg: BeginTransaction<E>,
+        mut ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let stream_id = StreamID::new_from_parts(E::name(), &msg.id);
+        let entity_ref = self
+            .get_or_start_entity_actor::<E>(&ctx.actor_ref(), stream_id)
+            .await;
+
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+        let begin = transaction::BeginTransaction {
+            tx_id: msg.tx_id,
+            is_buffered: false,
+        };
+        match reply_sender {
+            Some(tx) => {
+                let _ = entity_ref.ask(begin).forward(tx).await;
+            }
+            None => {
+                let _ = entity_ref.tell(begin).send().await;
             }
         }
 
